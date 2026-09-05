@@ -1,26 +1,27 @@
-# AI Research Agent with Mini MCP Tools & Gemini RAG Memory
+# AI Research Agent with FastMCP Server & Gemini RAG Memory
 
 An intelligent, stateful **AI Research Agent** powered by **LangGraph**, **FastMCP (Model Context Protocol)**, **Gemini Embeddings**, and **Streamlit**.
 
-The agent connects to academic and web research APIs (**arXiv**, **Wikipedia**, **PubMed**, **DuckDuckGo**) and maintains a cross-session RAG (Retrieval-Augmented Generation) memory store using **FAISS** and free **Gemini Embeddings**.
+The agent executes research tools directly through the **FastMCP Server** (`arxiv_search`, `wikipedia_search`, `pubmed_search`) and maintains a cross-session RAG (Retrieval-Augmented Generation) memory store using **FAISS** and free **Gemini Embeddings**.
 
 ---
 
 ## Key Features
 
 - **Stateful LangGraph Workflow**: Built on `StateGraph` using a `CurSession` TypedDict reducer (`prompts` & `replies`).
-- **Mini MCP Server & Academic Research APIs**:
-  - **arXiv**: Searches peer-reviewed computer science, AI, and math papers with author lists, abstracts, and direct PDF download links.
-  - **Wikipedia**: Retrieves encyclopedia definitions, summaries, and article links.
-  - **PubMed**: Queries NCBI PubMed for biomedical literature and clinical research.
-  - **DuckDuckGo**: General web search context.
+- **FastMCP Server & Academic Tools Integration**:
+  - **FastMCP Server Tool Execution**: `app.py` routes research requests through `mcp.call_tool(...)` on the `FastMCP` server instance.
+  - **arXiv Tool**: Searches peer-reviewed computer science, AI, and math papers with author lists, abstracts, and direct PDF download links.
+  - **Wikipedia Tool**: Retrieves encyclopedia definitions, summaries, and article links.
+  - **PubMed Tool**: Queries NCBI PubMed for biomedical literature and clinical research.
+  - **DuckDuckGo Tool**: General web search context.
 - **Cross-Session Gemini RAG Memory**:
   - Automatically exports chat turns as JSON files into `past_chats/`.
   - Indexes past research interactions using `GoogleGenerativeAIEmbeddings` (`models/text-embedding-004`) and `FAISS`.
   - Performs similarity searches over historical chats to provide cross-functional context awareness.
 - **Interactive Streamlit Interface**:
-  - Real-time chat interface.
-  - Sidebar configuration for OpenAI API keys, Google/Gemini API keys, model selection (`gpt-4o-mini`, `gpt-4o`, `gpt-3.5-turbo`), and toggles for individual research APIs.
+  - Real-time chat interface in `app.py`.
+  - Sidebar configuration for OpenAI API keys, Google/Gemini API keys, model selection (`gpt-4o-mini`, `gpt-4o`, `gpt-3.5-turbo`), and toggles for individual FastMCP research tools.
 
 ---
 
@@ -28,10 +29,10 @@ The agent connects to academic and web research APIs (**arXiv**, **Wikipedia**, 
 
 ```
 research_agent/
-├── app.py              # Main Streamlit Web Application & LangGraph State Machine
+├── app.py              # Main Streamlit Application invoking tools via FastMCP Server
+├── mcp_server.py       # FastMCP Server exposing research tool endpoints
+├── mcp_tools.py        # Academic API Tool implementations (arXiv, Wikipedia, PubMed)
 ├── retriever.py        # Past Chat JSON Persistence & Gemini FAISS Vector RAG Engine
-├── mcp_tools.py        # Academic Tools (arXiv, Wikipedia, PubMed, DuckDuckGo)
-├── mcp_server.py       # FastMCP Server exposing research tools via Model Context Protocol
 ├── past_chats/         # Directory storing session JSON files
 └── README.md           # Documentation
 ```
@@ -60,9 +61,9 @@ Launch the Streamlit interface:
 streamlit run app.py
 ```
 
-### Running the Mini MCP Server
+### Running the Standalone FastMCP Server
 
-You can also run the FastMCP server independently via stdio:
+You can also run the FastMCP server independently for external MCP clients via stdio:
 
 ```bash
 python mcp_server.py

@@ -1,5 +1,6 @@
 import operator
 import os
+import asyncio
 from typing import List, Dict, Any, Optional
 from typing_extensions import Annotated, TypedDict
 import streamlit as st
@@ -9,7 +10,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from retriever import save_chat_session, search_past_chats
-from mcp_tools import search_arxiv, search_wikipedia, search_pubmed
+from mcp_server import mcp
 
 # Load environment variables if available
 load_dotenv()
@@ -24,6 +25,19 @@ st.set_page_config(
 class CurSession(TypedDict):
     prompts: Annotated[List[str], operator.add]
     replies: Annotated[List[str], operator.add]
+
+# Helper function to invoke tools via FastMCP server
+def call_mcp_server_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """
+    Executes research tools through the FastMCP server instance.
+    """
+    try:
+        content_blocks, _ = asyncio.run(mcp.call_tool(tool_name, arguments))
+        if content_blocks:
+            return content_blocks[0].text
+        return f"No output returned from MCP tool {tool_name}."
+    except Exception as e:
+        return f"MCP server tool error ({tool_name}): {str(e)}"
 
 # Helper function for web research using ddgs
 def perform_web_search(query: str, max_results: int = 3) -> str:
@@ -43,12 +57,12 @@ def perform_web_search(query: str, max_results: int = 3) -> str:
     except Exception as e:
         return f"Web search unavailable ({str(e)})."
 
-# 2. Graph Node Function: takes user message, runs enabled MCP & search tools, attempts LLM response
+# 2. Graph Node Function: takes user message, runs enabled MCP server tools & LLM response
 def research_agent_node(state: CurSession) -> Dict[str, Any]:
     """
     LangGraph node function that takes the current state,
-    invokes enabled MCP research tools (arXiv, Wikipedia, PubMed, Web Search, Gemini Memory),
-    and synthesizes a comprehensive research response.
+    invokes tools strictly through the FastMCP server (arxiv_search, wikipedia_search, pubmed_search),
+    and synthesizes a comprehensive research report.
     """
     if not state["prompts"]:
         return {"replies": ["No user prompt found to process."]}
@@ -80,28 +94,28 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
             if past_chats_context and "No relevant past" not in past_chats_context and "No past chat" not in past_chats_context:
                 collected_contexts.append(f"### Relevant Past Chat History:\n{past_chats_context}")
 
-    # 2. arXiv Papers
+    # 2. arXiv Papers via FastMCP Server
     if enable_arxiv:
-        with st.spinner("Searching arXiv for academic papers..."):
-            arxiv_res = search_arxiv(latest_prompt, max_results=3)
+        with st.spinner("Invoking arxiv_search via FastMCP Server..."):
+            arxiv_res = call_mcp_server_tool("arxiv_search", {"query": latest_prompt, "max_results": 3})
             if arxiv_res and "No arXiv" not in arxiv_res:
-                collected_contexts.append(f"### arXiv Academic Papers:\n{arxiv_res}")
+                collected_contexts.append(f"### arXiv Academic Papers (via MCP Server):\n{arxiv_res}")
 
-    # 3. Wikipedia Summary
+    # 3. Wikipedia Summary via FastMCP Server
     if enable_wiki:
-        with st.spinner("Searching Wikipedia for encyclopedia facts..."):
-            wiki_res = search_wikipedia(latest_prompt, max_results=2)
+        with st.spinner("Invoking wikipedia_search via FastMCP Server..."):
+            wiki_res = call_mcp_server_tool("wikipedia_search", {"query": latest_prompt, "max_results": 2})
             if wiki_res and "No Wikipedia" not in wiki_res:
-                collected_contexts.append(f"### Wikipedia Encyclopedia Summary:\n{wiki_res}")
+                collected_contexts.append(f"### Wikipedia Encyclopedia Summary (via MCP Server):\n{wiki_res}")
 
-    # 4. PubMed Literature
+    # 4. PubMed Literature via FastMCP Server
     if enable_pubmed:
-        with st.spinner("Searching PubMed literature..."):
-            pubmed_res = search_pubmed(latest_prompt, max_results=3)
+        with st.spinner("Invoking pubmed_search via FastMCP Server..."):
+            pubmed_res = call_mcp_server_tool("pubmed_search", {"query": latest_prompt, "max_results": 3})
             if pubmed_res and "No PubMed" not in pubmed_res:
-                collected_contexts.append(f"### PubMed Research Literature:\n{pubmed_res}")
+                collected_contexts.append(f"### PubMed Research Literature (via MCP Server):\n{pubmed_res}")
 
-    # 5. Web Search
+    # 5. Web Search Context
     if enable_search:
         with st.spinner("Searching general web..."):
             search_context = perform_web_search(latest_prompt, max_results=3)
@@ -120,7 +134,7 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
             )
 
             system_instruction = (
-                "You are an expert AI Research Assistant equipped with academic APIs (arXiv, PubMed, Wikipedia, Web Search, and Past Chat Memory).\n"
+                "You are an expert AI Research Assistant equipped with tools exposed via FastMCP Server (arXiv, PubMed, Wikipedia, Web Search, and Past Chat Memory).\n"
                 "Provide detailed, well-structured, and rigorous research reports based on the user prompt and provided research context.\n"
                 "Use clear headings, bullet points, citations of arXiv/PubMed URLs, and summarize key technical insights."
             )
@@ -128,7 +142,7 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
             messages = [SystemMessage(content=system_instruction)]
 
             if collected_contexts:
-                messages.append(HumanMessage(content=f"Research Context Collected from APIs:\n\n{combined_context_text}"))
+                messages.append(HumanMessage(content=f"Research Context Collected from MCP Server Tools:\n\n{combined_context_text}"))
 
             # Add previous conversation turn history
             for p, r in zip(state["prompts"][:-1], state["replies"]):
@@ -142,13 +156,13 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
         except Exception as e:
             reply_text = (
                 f"**Error invoking LLM Model:** {str(e)}\n\n"
-                f"--- \n### Research Context Collected from Tools:\n\n{combined_context_text}"
+                f"--- \n### Research Context Collected from MCP Server:\n\n{combined_context_text}"
             )
     else:
         # Informative response when no OpenAI API key is configured yet
         reply_text = (
             "**OpenAI API Key is missing.** Please enter your API key in the sidebar to generate AI research synthesis.\n\n"
-            f"### Research Context Collected from Tools:\n\n{combined_context_text}"
+            f"### Research Context Collected from MCP Server:\n\n{combined_context_text}"
         )
 
     return {"replies": [reply_text]}
@@ -164,8 +178,8 @@ def build_research_graph():
 research_app_graph = build_research_graph()
 
 # 4. Streamlit UI Interface
-st.title("AI Research Agent with Mini MCP Tools")
-st.markdown("Powered by **LangGraph**, **FastMCP Tools** (arXiv, Wikipedia, PubMed, Web Search), and **Gemini Embeddings**.")
+st.title("AI Research Agent with FastMCP Server")
+st.markdown("Powered by **LangGraph**, **FastMCP Server**, and **Gemini Embeddings**.")
 
 # Sidebar Configuration
 with st.sidebar:
@@ -195,11 +209,11 @@ with st.sidebar:
     )
     st.session_state["model_name"] = model_choice
 
-    st.subheader("Research APIs & MCP Tools")
+    st.subheader("FastMCP Server Tools")
     st.session_state["enable_search"] = st.toggle("General Web Search (DuckDuckGo)", value=True)
-    st.session_state["enable_arxiv"] = st.toggle("arXiv Academic Papers", value=True)
-    st.session_state["enable_wiki"] = st.toggle("Wikipedia Summary", value=True)
-    st.session_state["enable_pubmed"] = st.toggle("PubMed Literature", value=False)
+    st.session_state["enable_arxiv"] = st.toggle("arXiv Academic Papers (MCP)", value=True)
+    st.session_state["enable_wiki"] = st.toggle("Wikipedia Summary (MCP)", value=True)
+    st.session_state["enable_pubmed"] = st.toggle("PubMed Literature (MCP)", value=False)
     st.session_state["enable_past_chats"] = st.toggle("Past Chat Memory (Gemini RAG)", value=True)
     
     st.divider()
@@ -244,7 +258,7 @@ if prompt:
     
     # Run graph execution
     with st.chat_message("assistant"):
-        with st.spinner("Researching across tools and synthesizing output..."):
+        with st.spinner("Researching across MCP server tools and synthesizing output..."):
             result = research_app_graph.invoke(inputs)
             latest_reply = result["replies"][-1]
             st.markdown(latest_reply)
