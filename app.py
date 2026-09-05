@@ -9,6 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from retriever import save_chat_session, search_past_chats
+from mcp_tools import search_arxiv, search_wikipedia, search_pubmed
 
 # Load environment variables if available
 load_dotenv()
@@ -42,11 +43,12 @@ def perform_web_search(query: str, max_results: int = 3) -> str:
     except Exception as e:
         return f"Web search unavailable ({str(e)})."
 
-# 2. Graph Node Function: takes user message, conducts web search research & attempts LLM response
+# 2. Graph Node Function: takes user message, runs enabled MCP & search tools, attempts LLM response
 def research_agent_node(state: CurSession) -> Dict[str, Any]:
     """
-    LangGraph node function that takes the current state (user messages in prompts),
-    conducts web search and searches past chat history using Gemini Embeddings.
+    LangGraph node function that takes the current state,
+    invokes enabled MCP research tools (arXiv, Wikipedia, PubMed, Web Search, Gemini Memory),
+    and synthesizes a comprehensive research response.
     """
     if not state["prompts"]:
         return {"replies": ["No user prompt found to process."]}
@@ -57,23 +59,56 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
     api_key = st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
     google_api_key = st.session_state.get("google_api_key") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     model_name = st.session_state.get("model_name", "gpt-4o-mini")
+    
     enable_search = st.session_state.get("enable_search", True)
+    enable_arxiv = st.session_state.get("enable_arxiv", True)
+    enable_wiki = st.session_state.get("enable_wiki", True)
+    enable_pubmed = st.session_state.get("enable_pubmed", False)
     enable_past_chats = st.session_state.get("enable_past_chats", True)
 
-    search_context = ""
-    if enable_search:
-        with st.spinner("Searching the web for research context..."):
-            search_context = perform_web_search(latest_prompt, max_results=3)
+    collected_contexts = []
 
-    past_chats_context = ""
+    # 1. Past Chat History Context (Gemini Embeddings RAG)
     if enable_past_chats:
-        with st.spinner("Searching past chat history using Gemini Embeddings..."):
+        with st.spinner("Searching past chat memory (Gemini Embeddings)..."):
             past_chats_context = search_past_chats(
                 query=latest_prompt,
                 google_api_key=google_api_key,
                 folder_path="past_chats",
                 top_k=3
             )
+            if past_chats_context and "No relevant past" not in past_chats_context and "No past chat" not in past_chats_context:
+                collected_contexts.append(f"### Relevant Past Chat History:\n{past_chats_context}")
+
+    # 2. arXiv Papers
+    if enable_arxiv:
+        with st.spinner("Searching arXiv for academic papers..."):
+            arxiv_res = search_arxiv(latest_prompt, max_results=3)
+            if arxiv_res and "No arXiv" not in arxiv_res:
+                collected_contexts.append(f"### arXiv Academic Papers:\n{arxiv_res}")
+
+    # 3. Wikipedia Summary
+    if enable_wiki:
+        with st.spinner("Searching Wikipedia for encyclopedia facts..."):
+            wiki_res = search_wikipedia(latest_prompt, max_results=2)
+            if wiki_res and "No Wikipedia" not in wiki_res:
+                collected_contexts.append(f"### Wikipedia Encyclopedia Summary:\n{wiki_res}")
+
+    # 4. PubMed Literature
+    if enable_pubmed:
+        with st.spinner("Searching PubMed literature..."):
+            pubmed_res = search_pubmed(latest_prompt, max_results=3)
+            if pubmed_res and "No PubMed" not in pubmed_res:
+                collected_contexts.append(f"### PubMed Research Literature:\n{pubmed_res}")
+
+    # 5. Web Search
+    if enable_search:
+        with st.spinner("Searching general web..."):
+            search_context = perform_web_search(latest_prompt, max_results=3)
+            if search_context and "unavailable" not in search_context and "No web results" not in search_context:
+                collected_contexts.append(f"### Web Search Context:\n{search_context}")
+
+    combined_context_text = "\n\n---\n\n".join(collected_contexts) if collected_contexts else "No external research context collected."
 
     if api_key:
         try:
@@ -85,22 +120,17 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
             )
 
             system_instruction = (
-                "You are an expert AI Research Assistant. Provide detailed, well-structured, "
-                "and informative research reports based on the user prompt, web context, and relevant past chat history.\n"
-                "Structure your response with clear headings, bullet points, and cite source URLs if provided."
+                "You are an expert AI Research Assistant equipped with academic APIs (arXiv, PubMed, Wikipedia, Web Search, and Past Chat Memory).\n"
+                "Provide detailed, well-structured, and rigorous research reports based on the user prompt and provided research context.\n"
+                "Use clear headings, bullet points, citations of arXiv/PubMed URLs, and summarize key technical insights."
             )
             
             messages = [SystemMessage(content=system_instruction)]
 
-            # Add past chat context if relevant
-            if past_chats_context and "No relevant past" not in past_chats_context and "No past chat" not in past_chats_context:
-                messages.append(HumanMessage(content=f"Relevant Past Chat History (Cross-session Memory):\n{past_chats_context}"))
+            if collected_contexts:
+                messages.append(HumanMessage(content=f"Research Context Collected from APIs:\n\n{combined_context_text}"))
 
-            # Add web search context if available
-            if search_context and "unavailable" not in search_context and "No web results" not in search_context:
-                messages.append(HumanMessage(content=f"Web Search Results for research context:\n{search_context}"))
-
-            # Add previous prompt/reply conversation history if present in state
+            # Add previous conversation turn history
             for p, r in zip(state["prompts"][:-1], state["replies"]):
                 messages.append(HumanMessage(content=p))
                 messages.append(AIMessage(content=r))
@@ -112,14 +142,13 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
         except Exception as e:
             reply_text = (
                 f"**Error invoking LLM Model:** {str(e)}\n\n"
-                f"--- \n### Web Research Results Collected:\n\n{search_context if search_context else 'No research context available.'}"
+                f"--- \n### Research Context Collected from Tools:\n\n{combined_context_text}"
             )
     else:
         # Informative response when no OpenAI API key is configured yet
         reply_text = (
             "**OpenAI API Key is missing.** Please enter your API key in the sidebar to generate AI research synthesis.\n\n"
-            f"### Raw Web Research Context Collected:\n\n{search_context if search_context else 'Web search did not return results.'}\n\n"
-            f"### Relevant Past Chat History:\n\n{past_chats_context if past_chats_context else 'No past chat history found.'}"
+            f"### Research Context Collected from Tools:\n\n{combined_context_text}"
         )
 
     return {"replies": [reply_text]}
@@ -135,12 +164,12 @@ def build_research_graph():
 research_app_graph = build_research_graph()
 
 # 4. Streamlit UI Interface
-st.title("AI Research Agent")
-st.markdown("Powered by **LangGraph**, **LangChain**, **Gemini Embeddings**, and **Streamlit**.")
+st.title("AI Research Agent with Mini MCP Tools")
+st.markdown("Powered by **LangGraph**, **FastMCP Tools** (arXiv, Wikipedia, PubMed, Web Search), and **Gemini Embeddings**.")
 
 # Sidebar Configuration
 with st.sidebar:
-    st.header("Configuration")
+    st.header("Configuration & Keys")
     api_key_input = st.text_input(
         "OpenAI API Key",
         value=os.getenv("OPENAI_API_KEY", ""),
@@ -165,12 +194,13 @@ with st.sidebar:
         index=0
     )
     st.session_state["model_name"] = model_choice
-    
-    enable_search = st.toggle("Enable Web Search Context", value=True)
-    st.session_state["enable_search"] = enable_search
 
-    enable_past_chats = st.toggle("Enable Past Chat Context (Gemini Memory)", value=True)
-    st.session_state["enable_past_chats"] = enable_past_chats
+    st.subheader("Research APIs & MCP Tools")
+    st.session_state["enable_search"] = st.toggle("General Web Search (DuckDuckGo)", value=True)
+    st.session_state["enable_arxiv"] = st.toggle("arXiv Academic Papers", value=True)
+    st.session_state["enable_wiki"] = st.toggle("Wikipedia Summary", value=True)
+    st.session_state["enable_pubmed"] = st.toggle("PubMed Literature", value=False)
+    st.session_state["enable_past_chats"] = st.toggle("Past Chat Memory (Gemini RAG)", value=True)
     
     st.divider()
     if st.button("Clear Chat History", type="secondary"):
@@ -214,7 +244,7 @@ if prompt:
     
     # Run graph execution
     with st.chat_message("assistant"):
-        with st.spinner("Researching and synthesizing output..."):
+        with st.spinner("Researching across tools and synthesizing output..."):
             result = research_app_graph.invoke(inputs)
             latest_reply = result["replies"][-1]
             st.markdown(latest_reply)
@@ -223,7 +253,7 @@ if prompt:
     st.session_state["prompts"].append(prompt)
     st.session_state["replies"].append(latest_reply)
 
-    # Continuously save chat session state to past_chats folder as JSON
+    # Save chat session state to past_chats folder as JSON
     session_id = st.session_state.get("session_id")
     saved_session_id = save_chat_session(
         prompts=st.session_state["prompts"],
