@@ -7,6 +7,18 @@ from typing import List, Dict, Any, Optional
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# Re-export knowledge base helpers so app.py has a single import point
+from knowledge_base import build_knowledge_base_if_needed, search_knowledge_base
+
+__all__ = [
+    "save_chat_session",
+    "load_all_chat_sessions",
+    "prepare_chat_documents",
+    "search_past_chats",
+    "build_knowledge_base_if_needed",
+    "search_knowledge_base",
+]
+
 # 1. Save state continuously as JSON in past_chats directory
 def save_chat_session(
     prompts: List[str],

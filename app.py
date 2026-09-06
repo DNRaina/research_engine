@@ -9,28 +9,53 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-from retriever import save_chat_session, search_past_chats
+from retriever import (
+    save_chat_session,
+    search_past_chats,
+    build_knowledge_base_if_needed,
+    search_knowledge_base,
+)
 from mcp_server import mcp
 
-# Load environment variables if available
+# Load environment variables
 load_dotenv()
 
-# Set page configuration
+# ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Research Agent",
-    layout="wide"
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# 1. State Definition matching user's original schema
+# ─── State Schema ─────────────────────────────────────────────────────────────
 class CurSession(TypedDict):
     prompts: Annotated[List[str], operator.add]
     replies: Annotated[List[str], operator.add]
 
-# Helper function to invoke tools via FastMCP server
+# ─── Knowledge Base — build once at startup ───────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _init_knowledge_base():
+    """
+    Runs once per Streamlit process. Checks whether books/ has changed and
+    rebuilds the FAISS index in scans/ only when needed.
+    """
+    google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    try:
+        status = build_knowledge_base_if_needed(
+            books_dir="books",
+            scans_dir="scans",
+            google_api_key=google_api_key,
+        )
+        return status
+    except Exception as e:
+        return f"error: {e}"
+
+kb_init_status = _init_knowledge_base()
+
+# ─── MCP Tool Caller ──────────────────────────────────────────────────────────
 def call_mcp_server_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """
-    Executes research tools through the FastMCP server instance.
-    """
+    """Execute a registered FastMCP tool and return its text output."""
     try:
         content_blocks, _ = asyncio.run(mcp.call_tool(tool_name, arguments))
         if content_blocks:
@@ -39,112 +64,191 @@ def call_mcp_server_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
     except Exception as e:
         return f"MCP server tool error ({tool_name}): {str(e)}"
 
-# Helper function for web research using ddgs
+# ─── Web Search ───────────────────────────────────────────────────────────────
 def perform_web_search(query: str, max_results: int = 3) -> str:
-    """Performs web search using ddgs package to retrieve relevant content."""
+    """DuckDuckGo web search via the ddgs package."""
     try:
         from ddgs import DDGS
         results = list(DDGS().text(query, max_results=max_results))
         if not results:
             return "No web results found."
-        formatted_snippets = []
+        snippets = []
         for i, res in enumerate(results, 1):
-            title = res.get("title", "No Title")
+            title   = res.get("title", "No Title")
             snippet = res.get("body", res.get("snippet", ""))
-            href = res.get("href", res.get("link", ""))
-            formatted_snippets.append(f"[{i}] {title}\nURL: {href}\nSummary: {snippet}")
-        return "\n\n".join(formatted_snippets)
+            href    = res.get("href", res.get("link", ""))
+            snippets.append(f"[{i}] {title}\nURL: {href}\nSummary: {snippet}")
+        return "\n\n".join(snippets)
     except Exception as e:
         return f"Web search unavailable ({str(e)})."
 
-# 2. Graph Node Function: takes user message, runs enabled MCP server tools & LLM response
+# ─── LLM Factory ──────────────────────────────────────────────────────────────
+def _get_llm(model_name: str, openai_key: Optional[str], google_key: Optional[str]):
+    """
+    Return the appropriate LangChain chat model based on selected model name.
+    Supports OpenAI (gpt-*) and Google Gemini (gemini-*).
+    """
+    if model_name.startswith("gemini"):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        if not google_key:
+            raise ValueError("Google / Gemini API key is required for Gemini models.")
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=google_key,
+            temperature=0.4,
+            convert_system_message_to_human=False,
+        )
+    else:
+        from langchain_openai import ChatOpenAI
+        if not openai_key:
+            raise ValueError("OpenAI API key is required for GPT models.")
+        return ChatOpenAI(
+            model=model_name,
+            openai_api_key=openai_key,
+            temperature=0.4,
+        )
+
+# ─── System Prompt ────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are an expert AI Research Assistant with access to multiple knowledge sources:
+  • Academic papers (arXiv, PubMed)
+  • Encyclopaedic knowledge (Wikipedia)
+  • General web search (DuckDuckGo)
+  • A local knowledge base of curated books and documents
+  • Memory of past conversations
+
+## Your Reasoning Protocol
+Before writing your answer, silently work through these steps:
+  1. **Understand** — Identify exactly what the user is asking. Distinguish factual questions, conceptual explanations, comparisons, and open-ended research queries.
+  2. **Evaluate sources** — Critically assess each provided context block. Note which sources are authoritative (peer-reviewed papers, textbooks) vs. secondary (web snippets). Discard irrelevant or contradictory snippets.
+  3. **Synthesise** — Do NOT just copy-paste context. Extract key concepts, compare perspectives, identify consensus and gaps. Apply your own domain knowledge to fill in missing context.
+  4. **Structure** — Write a well-organised Markdown report using the output format below.
+
+## Output Format
+Always structure responses as follows:
+
+### 🔍 Overview
+A concise 2–4 sentence summary answering the core question directly.
+
+### 📌 Key Findings
+Use bullet points or numbered lists for distinct insights. Each point should be a synthesis, not a copy of the raw context.
+
+### 📚 Sources & Evidence
+Cite specific sources with URLs where available. Format: `[Source Name](URL) — one-line description`.
+
+### 💡 Conclusions & Further Research
+A brief synthesis paragraph. Suggest follow-up angles or open questions where appropriate.
+
+## Rules
+- Be precise and technically rigorous. Prefer specificity over vagueness.
+- If the context is insufficient to answer confidently, say so explicitly rather than hallucinating.
+- Keep tone professional but accessible.
+- Use inline code formatting for technical terms, model names, formulas, etc.
+"""
+
+# ─── Research Agent Node ──────────────────────────────────────────────────────
 def research_agent_node(state: CurSession) -> Dict[str, Any]:
     """
-    LangGraph node function that takes the current state,
-    invokes tools strictly through the FastMCP server (arxiv_search, wikipedia_search, pubmed_search),
-    and synthesizes a comprehensive research report.
+    LangGraph node: gathers context from all enabled sources, then calls the
+    LLM with a structured system prompt to synthesise a research report.
     """
     if not state["prompts"]:
         return {"replies": ["No user prompt found to process."]}
 
     latest_prompt = state["prompts"][-1]
-    
-    # Retrieve configuration from session state or env
-    api_key = st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
-    google_api_key = st.session_state.get("google_api_key") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    model_name = st.session_state.get("model_name", "gpt-4o-mini")
-    
-    enable_search = st.session_state.get("enable_search", True)
-    enable_arxiv = st.session_state.get("enable_arxiv", True)
-    enable_wiki = st.session_state.get("enable_wiki", True)
-    enable_pubmed = st.session_state.get("enable_pubmed", False)
+
+    # ── Retrieve config ──────────────────────────────────────────────────────
+    openai_key  = st.session_state.get("openai_api_key")  or os.getenv("OPENAI_API_KEY")
+    google_key  = st.session_state.get("google_api_key")  or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    model_name  = st.session_state.get("model_name", "gpt-4o-mini")
+
+    enable_search    = st.session_state.get("enable_search", True)
+    enable_arxiv     = st.session_state.get("enable_arxiv", True)
+    enable_wiki      = st.session_state.get("enable_wiki", True)
+    enable_pubmed    = st.session_state.get("enable_pubmed", False)
     enable_past_chats = st.session_state.get("enable_past_chats", True)
+    enable_kb        = st.session_state.get("enable_kb", True)
 
     collected_contexts = []
 
-    # 1. Past Chat History Context (Gemini Embeddings RAG)
-    if enable_past_chats:
-        with st.spinner("Searching past chat memory (Gemini Embeddings)..."):
-            past_chats_context = search_past_chats(
+    # ── 1. Local Knowledge Base (books → scans FAISS) ────────────────────────
+    if enable_kb:
+        with st.spinner("🔎 Searching local knowledge base..."):
+            kb_context = search_knowledge_base(
                 query=latest_prompt,
-                google_api_key=google_api_key,
-                folder_path="past_chats",
-                top_k=3
+                google_api_key=google_key,
+                scans_dir="scans",
+                top_k=4,
             )
-            if past_chats_context and "No relevant past" not in past_chats_context and "No past chat" not in past_chats_context:
-                collected_contexts.append(f"### Relevant Past Chat History:\n{past_chats_context}")
+            if kb_context:
+                collected_contexts.append(f"### 📚 Local Knowledge Base (Books):\n{kb_context}")
 
-    # 2. arXiv Papers via FastMCP Server
+    # ── 2. Past Chat Memory ──────────────────────────────────────────────────
+    if enable_past_chats:
+        with st.spinner("🧠 Searching past chat memory..."):
+            past_context = search_past_chats(
+                query=latest_prompt,
+                google_api_key=google_key,
+                folder_path="past_chats",
+                top_k=3,
+            )
+            if past_context and "No relevant past" not in past_context and "No past chat" not in past_context:
+                collected_contexts.append(f"### 🗂️ Relevant Past Conversations:\n{past_context}")
+
+    # ── 3. arXiv Papers ──────────────────────────────────────────────────────
     if enable_arxiv:
-        with st.spinner("Invoking arxiv_search via FastMCP Server..."):
+        with st.spinner("📄 Fetching arXiv papers..."):
             arxiv_res = call_mcp_server_tool("arxiv_search", {"query": latest_prompt, "max_results": 3})
-            if arxiv_res and "No arXiv" not in arxiv_res:
-                collected_contexts.append(f"### arXiv Academic Papers (via MCP Server):\n{arxiv_res}")
+            if arxiv_res and "No arXiv" not in arxiv_res and "error" not in arxiv_res.lower():
+                collected_contexts.append(f"### 🎓 arXiv Academic Papers:\n{arxiv_res}")
 
-    # 3. Wikipedia Summary via FastMCP Server
+    # ── 4. Wikipedia ─────────────────────────────────────────────────────────
     if enable_wiki:
-        with st.spinner("Invoking wikipedia_search via FastMCP Server..."):
+        with st.spinner("🌐 Querying Wikipedia..."):
             wiki_res = call_mcp_server_tool("wikipedia_search", {"query": latest_prompt, "max_results": 2})
             if wiki_res and "No Wikipedia" not in wiki_res:
-                collected_contexts.append(f"### Wikipedia Encyclopedia Summary (via MCP Server):\n{wiki_res}")
+                collected_contexts.append(f"### 📖 Wikipedia:\n{wiki_res}")
 
-    # 4. PubMed Literature via FastMCP Server
+    # ── 5. PubMed Literature ─────────────────────────────────────────────────
     if enable_pubmed:
-        with st.spinner("Invoking pubmed_search via FastMCP Server..."):
+        with st.spinner("🧬 Searching PubMed..."):
             pubmed_res = call_mcp_server_tool("pubmed_search", {"query": latest_prompt, "max_results": 3})
             if pubmed_res and "No PubMed" not in pubmed_res:
-                collected_contexts.append(f"### PubMed Research Literature (via MCP Server):\n{pubmed_res}")
+                collected_contexts.append(f"### 🧬 PubMed Literature:\n{pubmed_res}")
 
-    # 5. Web Search Context
+    # ── 6. General Web Search ────────────────────────────────────────────────
     if enable_search:
-        with st.spinner("Searching general web..."):
-            search_context = perform_web_search(latest_prompt, max_results=3)
-            if search_context and "unavailable" not in search_context and "No web results" not in search_context:
-                collected_contexts.append(f"### Web Search Context:\n{search_context}")
+        with st.spinner("🔍 Running web search..."):
+            web_res = perform_web_search(latest_prompt, max_results=3)
+            if web_res and "unavailable" not in web_res and "No web results" not in web_res:
+                collected_contexts.append(f"### 🌍 Web Search:\n{web_res}")
 
-    combined_context_text = "\n\n---\n\n".join(collected_contexts) if collected_contexts else "No external research context collected."
+    # ── Assemble context block ───────────────────────────────────────────────
+    if collected_contexts:
+        combined_context = "\n\n---\n\n".join(collected_contexts)
+        context_header = (
+            f"## Research Context\n\n"
+            f"The following information was retrieved from {len(collected_contexts)} source(s). "
+            f"Use this to inform your response:\n\n{combined_context}"
+        )
+    else:
+        context_header = "No external research context was collected."
 
-    if api_key:
+    # ── Build LLM messages ───────────────────────────────────────────────────
+    has_openai_key  = bool(openai_key)
+    has_gemini_key  = bool(google_key)
+    can_use_llm     = (model_name.startswith("gemini") and has_gemini_key) or \
+                      (not model_name.startswith("gemini") and has_openai_key)
+
+    if can_use_llm:
         try:
-            from langchain_openai import ChatOpenAI
-            llm = ChatOpenAI(
-                model=model_name,
-                openai_api_key=api_key,
-                temperature=0.7
-            )
+            llm = _get_llm(model_name, openai_key, google_key)
 
-            system_instruction = (
-                "You are an expert AI Research Assistant equipped with tools exposed via FastMCP Server (arXiv, PubMed, Wikipedia, Web Search, and Past Chat Memory).\n"
-                "Provide detailed, well-structured, and rigorous research reports based on the user prompt and provided research context.\n"
-                "Use clear headings, bullet points, citations of arXiv/PubMed URLs, and summarize key technical insights."
-            )
-            
-            messages = [SystemMessage(content=system_instruction)]
+            messages = [SystemMessage(content=SYSTEM_PROMPT)]
 
-            if collected_contexts:
-                messages.append(HumanMessage(content=f"Research Context Collected from MCP Server Tools:\n\n{combined_context_text}"))
+            # Inject context as a human message so the LLM can reason over it
+            messages.append(HumanMessage(content=context_header))
 
-            # Add previous conversation turn history
+            # Re-inject conversation history
             for p, r in zip(state["prompts"][:-1], state["replies"]):
                 messages.append(HumanMessage(content=p))
                 messages.append(AIMessage(content=r))
@@ -153,21 +257,27 @@ def research_agent_node(state: CurSession) -> Dict[str, Any]:
 
             response = llm.invoke(messages)
             reply_text = response.content
+
         except Exception as e:
             reply_text = (
-                f"**Error invoking LLM Model:** {str(e)}\n\n"
-                f"--- \n### Research Context Collected from MCP Server:\n\n{combined_context_text}"
+                f"**⚠️ LLM Error:** `{str(e)}`\n\n"
+                f"---\n\n{context_header}"
             )
     else:
-        # Informative response when no OpenAI API key is configured yet
+        missing = []
+        if not model_name.startswith("gemini") and not has_openai_key:
+            missing.append("OpenAI API key")
+        if model_name.startswith("gemini") and not has_gemini_key:
+            missing.append("Google / Gemini API key")
         reply_text = (
-            "**OpenAI API Key is missing.** Please enter your API key in the sidebar to generate AI research synthesis.\n\n"
-            f"### Research Context Collected from MCP Server:\n\n{combined_context_text}"
+            f"**🔑 Missing API Key(s): {', '.join(missing)}**\n\n"
+            f"Please enter the required key(s) in the sidebar.\n\n"
+            f"---\n\n{context_header}"
         )
 
     return {"replies": [reply_text]}
 
-# 3. LangGraph Workflow Construction
+# ─── LangGraph Workflow ───────────────────────────────────────────────────────
 def build_research_graph():
     builder = StateGraph(CurSession)
     builder.add_node("researcher", research_agent_node)
@@ -177,65 +287,97 @@ def build_research_graph():
 
 research_app_graph = build_research_graph()
 
-# 4. Streamlit UI Interface
-st.title("AI Research Agent with FastMCP Server")
-st.markdown("Powered by **LangGraph**, **FastMCP Server**, and **Gemini Embeddings**.")
-
-# Sidebar Configuration
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Configuration & Keys")
-    api_key_input = st.text_input(
+    st.markdown("## ⚙️ Configuration")
+
+    st.markdown("### 🔑 API Keys")
+    openai_input = st.text_input(
         "OpenAI API Key",
         value=os.getenv("OPENAI_API_KEY", ""),
         type="password",
-        help="Enter your OpenAI API key to enable LLM research synthesis."
+        help="Required for GPT-4o / GPT-3.5 models.",
     )
-    if api_key_input:
-        st.session_state["openai_api_key"] = api_key_input
+    if openai_input:
+        st.session_state["openai_api_key"] = openai_input
 
-    google_api_key_input = st.text_input(
+    google_input = st.text_input(
         "Google / Gemini API Key",
         value=os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", "")),
         type="password",
-        help="Enter your Google/Gemini API key for free Gemini embeddings & vector retrieval."
+        help="Required for Gemini models and knowledge base embeddings.",
     )
-    if google_api_key_input:
-        st.session_state["google_api_key"] = google_api_key_input
-        
+    if google_input:
+        st.session_state["google_api_key"] = google_input
+
+    st.markdown("### 🤖 Model")
     model_choice = st.selectbox(
         "Select Model",
-        options=["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
-        index=0
+        options=[
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-3.5-turbo",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
+        index=0,
+        help="GPT models require an OpenAI key. Gemini models require a Google key.",
     )
     st.session_state["model_name"] = model_choice
 
-    st.subheader("FastMCP Server Tools")
-    st.session_state["enable_search"] = st.toggle("General Web Search (DuckDuckGo)", value=True)
-    st.session_state["enable_arxiv"] = st.toggle("arXiv Academic Papers (MCP)", value=True)
-    st.session_state["enable_wiki"] = st.toggle("Wikipedia Summary (MCP)", value=True)
-    st.session_state["enable_pubmed"] = st.toggle("PubMed Literature (MCP)", value=False)
-    st.session_state["enable_past_chats"] = st.toggle("Past Chat Memory (Gemini RAG)", value=True)
-    
+    st.markdown("### 🔧 Research Sources")
+    st.session_state["enable_kb"]         = st.toggle("📚 Local Knowledge Base (Books)", value=True)
+    st.session_state["enable_past_chats"] = st.toggle("🧠 Past Chat Memory (RAG)",       value=True)
+    st.session_state["enable_arxiv"]      = st.toggle("🎓 arXiv Papers (MCP)",            value=True)
+    st.session_state["enable_wiki"]       = st.toggle("📖 Wikipedia (MCP)",               value=True)
+    st.session_state["enable_pubmed"]     = st.toggle("🧬 PubMed Literature (MCP)",       value=False)
+    st.session_state["enable_search"]     = st.toggle("🌍 Web Search (DuckDuckGo)",       value=True)
+
+    # Knowledge base status indicator
+    st.markdown("---")
+    st.markdown("### 📦 Knowledge Base")
+    if kb_init_status == "built":
+        st.success("✅ Index built from books/")
+    elif kb_init_status == "up_to_date":
+        st.info("✅ Index up to date")
+    elif kb_init_status == "no_books":
+        st.warning("📂 No books found in `books/` — add `.pdf`, `.txt`, or `.md` files.")
+    elif kb_init_status == "no_api_key":
+        st.warning("🔑 Set a Google API key to enable the knowledge base.")
+    else:
+        st.error(f"KB Error: {kb_init_status}")
+
     st.divider()
-    if st.button("Clear Chat History", type="secondary"):
+    if st.button("🗑️ Clear Chat History", type="secondary"):
         st.session_state["prompts"] = []
         st.session_state["replies"] = []
         if "session_id" in st.session_state:
             del st.session_state["session_id"]
         st.rerun()
 
-# Initialize Streamlit Session State for CurSession state tracking
+# ─── Main UI ──────────────────────────────────────────────────────────────────
+st.title("🔬 AI Research Agent")
+st.markdown(
+    "Powered by **LangGraph** · **FastMCP** · **Gemini Embeddings** · **FAISS Knowledge Base**"
+)
+
+# Init session state
 if "prompts" not in st.session_state:
     st.session_state["prompts"] = []
 if "replies" not in st.session_state:
     st.session_state["replies"] = []
 
-# Display welcome message from assistant if conversation is empty
+# Welcome message
 if not st.session_state["prompts"]:
     with st.chat_message("assistant"):
-        st.write("Hello! What do you want to research today?")
+        st.write(
+            "Hello! I'm your AI Research Assistant. I can search arXiv, Wikipedia, PubMed, "
+            "the web, your personal book collection, and our past conversations to give you "
+            "a structured, well-reasoned research report. What would you like to explore?"
+        )
 
-# Render past chat history
+# Render conversation history
 for user_p, bot_r in zip(st.session_state["prompts"], st.session_state["replies"]):
     with st.chat_message("user"):
         st.write(user_p)
@@ -243,36 +385,29 @@ for user_p, bot_r in zip(st.session_state["prompts"], st.session_state["replies"
         st.markdown(bot_r)
 
 # Chat input
-prompt = st.chat_input("Go ahead and type here...")
+prompt = st.chat_input("Ask a research question...")
 
 if prompt:
-    # Render user prompt immediately
     with st.chat_message("user"):
         st.write(prompt)
-        
-    # Prepare state for LangGraph execution
-    inputs: CurSession = {
-        "prompts": [prompt],
-        "replies": []
-    }
-    
-    # Run graph execution
+
+    inputs: CurSession = {"prompts": [prompt], "replies": []}
+
     with st.chat_message("assistant"):
-        with st.spinner("Researching across MCP server tools and synthesizing output..."):
+        with st.spinner("Researching and synthesising..."):
             result = research_app_graph.invoke(inputs)
             latest_reply = result["replies"][-1]
             st.markdown(latest_reply)
-            
-    # Update Streamlit session state history
+
     st.session_state["prompts"].append(prompt)
     st.session_state["replies"].append(latest_reply)
 
-    # Save chat session state to past_chats folder as JSON
+    # Persist session
     session_id = st.session_state.get("session_id")
-    saved_session_id = save_chat_session(
+    saved_id = save_chat_session(
         prompts=st.session_state["prompts"],
         replies=st.session_state["replies"],
         folder_path="past_chats",
-        session_id=session_id
+        session_id=session_id,
     )
-    st.session_state["session_id"] = saved_session_id
+    st.session_state["session_id"] = saved_id

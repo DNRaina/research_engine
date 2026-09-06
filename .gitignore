@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 /past_chats
+/books
+/scans
+/past_sessions
+
 # Distribution / packaging
 .Python
 build/
