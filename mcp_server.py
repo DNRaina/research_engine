@@ -151,16 +151,17 @@ def knowledge_base_search(query: str, api_key: str = "", top_k: int = 4) -> str:
 @mcp.tool()
 def memory_search(query: str, api_key: str = "", top_k: int = 3) -> str:
     """
-    Search past conversation history using Gemini embeddings and FAISS.
+    Search past conversation history using the persistent Gemini+FAISS memory index.
+    Falls back to keyword search if the index is not yet built.
     Pass api_key explicitly or set GOOGLE_API_KEY / GEMINI_API_KEY in the environment.
     """
-    from retriever import search_past_chats
+    from retriever import search_memory_index
     key    = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     result = _tool_wrapper(
-        search_past_chats,
+        search_memory_index,
         timeout_s=15,
         max_attempts=2,
-    )(query=query, google_api_key=key, folder_path="past_chats", top_k=top_k)
+    )(query=query, google_api_key=key, scans_dir="scans", top_k=top_k)
     return result or "No relevant past conversations found."
 
 

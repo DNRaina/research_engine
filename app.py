@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 
-from retriever import save_chat_session, build_knowledge_base_if_needed
+from retriever import save_chat_session, build_knowledge_base_if_needed, build_memory_index
 from mcp_server import mcp
 
 load_dotenv()
@@ -142,7 +142,34 @@ class ResearchState(TypedDict):
     contexts:  Annotated[List[str], operator.add]
 
 
-# ─── Knowledge base: build once at startup ───────────────────────────────────
+# ─── API key persistence ─────────────────────────────────────────────────────
+
+def _persist_key_to_env(key: str, var: str = "GOOGLE_API_KEY") -> None:
+    """
+    Write the API key to .env so it survives restarts.
+    Updates an existing line if the variable is already present, appends otherwise.
+    Also sets the variable in the current process so load_dotenv() isn't needed again.
+    """
+    env_path = ".env"
+    lines: List[str] = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    updated = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{var}="):
+            lines[i] = f"{var}={key}\n"
+            updated   = True
+            break
+    if not updated:
+        lines.append(f"{var}={key}\n")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    os.environ[var] = key
+
 
 @st.cache_resource(show_spinner=False)
 def _init_knowledge_base() -> str:
@@ -214,16 +241,31 @@ def orchestrator_node(state: ResearchState) -> Dict[str, Any]:
     """
     Heuristic router. Scores each enabled tool against the query and returns
     an ordered tool_plan. No LLM call — instant decision, zero API cost.
+
+    Tools that require a Google/Gemini API key (knowledge_base_search,
+    memory_search) are automatically excluded from the plan when no key
+    is configured, avoiding wasted parallel threads.
     """
     query   = state["prompts"][-1]
     q_lower = query.lower()
     words   = set(q_lower.split())
+
+    google_key = (
+        st.session_state.get("google_api_key")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or ""
+    )
 
     # Collect enabled tools from session state
     enabled: List[str] = [
         tool for key, tool in TOGGLE_MAP.items()
         if st.session_state.get(key, key not in ("enable_pubmed",))
     ]
+
+    # kb_search and memory_search require Gemini embeddings — skip without a key
+    if not google_key:
+        enabled = [t for t in enabled if t not in ("knowledge_base_search", "memory_search")]
 
     # Score each enabled tool
     scores: Dict[str, int] = {t: 10 for t in enabled}
@@ -372,12 +414,7 @@ def synthesiser_node(state: ResearchState) -> Dict[str, Any]:
     )
     model_name = st.session_state.get("model_name", "gemini-2.0-flash")
 
-    if not google_key:
-        return {"replies": [
-            "**Configuration required:** No Google/Gemini API key set.\n\n"
-            "Enter your key in the sidebar to enable AI synthesis."
-        ]}
-
+    # Always build the context block — it is shown regardless of API key
     if contexts:
         ctx_block = (
             f"## Retrieved Context ({len(contexts)} source(s))\n\n"
@@ -385,6 +422,15 @@ def synthesiser_node(state: ResearchState) -> Dict[str, Any]:
         )
     else:
         ctx_block = "No external research context was retrieved."
+
+    # No API key → show a clear notice and the raw context; do not block
+    if not google_key:
+        return {"replies": [
+            "> **No Gemini API key configured.** "
+            "LLM synthesis is disabled — showing raw research context below. "
+            "Add your key in the sidebar to enable AI-powered synthesis.\n\n"
+            "---\n\n" + ctx_block
+        ]}
 
     try:
         llm = _get_llm(model_name, google_key)
@@ -452,6 +498,9 @@ with st.sidebar:
         help="Used for both the Gemini LLM and knowledge base embeddings.",
     )
     if google_key_input:
+        # Persist to .env so restarts don't ask again
+        if google_key_input != os.getenv("GOOGLE_API_KEY", ""):
+            _persist_key_to_env(google_key_input, "GOOGLE_API_KEY")
         st.session_state["google_api_key"] = google_key_input
 
     st.markdown('<p class="sidebar-section">Model</p>', unsafe_allow_html=True)
@@ -573,6 +622,7 @@ if prompt:
     st.session_state["prompts"].append(prompt)
     st.session_state["replies"].append(reply)
 
+    # Persist chat to past_chats/ JSON
     session_id = st.session_state.get("session_id")
     saved_id   = save_chat_session(
         prompts=st.session_state["prompts"],
@@ -581,3 +631,20 @@ if prompt:
         session_id=session_id,
     )
     st.session_state["session_id"] = saved_id
+
+    # Refresh the persistent memory index in the background so the next
+    # query can search this turn without rebuilding from scratch.
+    google_key = (
+        st.session_state.get("google_api_key")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+    )
+    if google_key:
+        try:
+            build_memory_index(
+                google_api_key=google_key,
+                folder_path="past_chats",
+                scans_dir="scans",
+            )
+        except Exception as _mem_exc:
+            logger.warning("Memory index refresh failed: %s", _mem_exc)

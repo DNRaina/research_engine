@@ -24,11 +24,19 @@ print("=" * 60)
 
 try:
     from knowledge_base import build_knowledge_base_if_needed
-    status = build_knowledge_base_if_needed(
+    from retriever import build_memory_index
+
+    kb_status = build_knowledge_base_if_needed(
         books_dir="books",
         scans_dir="scans",
     )
-    print(f"Knowledge base status: {status}")
+    print(f"Knowledge base : {kb_status}")
+
+    mem_status = build_memory_index(
+        folder_path="past_chats",
+        scans_dir="scans",
+    )
+    print(f"Memory index   : {mem_status}")
 except Exception as e:
     print(f"Knowledge base build skipped: {e}")
 
