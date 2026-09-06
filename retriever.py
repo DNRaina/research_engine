@@ -27,6 +27,7 @@ MEMORY_INDEX_SUBDIR = "memory_index"
 
 __all__ = [
     "save_chat_session",
+    "delete_chat_session",
     "load_all_chat_sessions",
     "prepare_chat_documents",
     "build_memory_index",
@@ -44,10 +45,12 @@ def save_chat_session(
     replies: List[str],
     folder_path: str = "past_chats",
     session_id: Optional[str] = None,
+    latest_contexts: Optional[List[str]] = None,
 ) -> str:
     """
     Save or update the current chat session as a JSON file.
-    Returns the session_id (existing or newly created).
+    latest_contexts: the raw retrieved context blocks for the most recent turn.
+    Returns the session_id.
     """
     os.makedirs(folder_path, exist_ok=True)
 
@@ -55,15 +58,45 @@ def save_chat_session(
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     file_path = os.path.join(folder_path, f"{session_id}.json")
+
+    # Load existing chats so we preserve contexts from prior turns
+    existing_chats: List[Dict[str, Any]] = []
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                existing_chats = json.load(f).get("chats", [])
+        except Exception:
+            pass
+
+    chats: List[Dict[str, Any]] = []
+    for i, (p, r) in enumerate(zip(prompts, replies)):
+        turn: Dict[str, Any] = {"prompt": p, "reply": r}
+        # Preserve contexts from previously saved turns
+        if i < len(existing_chats) and "contexts" in existing_chats[i]:
+            turn["contexts"] = existing_chats[i]["contexts"]
+        # Attach fresh contexts to the latest (last) turn
+        if i == len(prompts) - 1 and latest_contexts:
+            turn["contexts"] = latest_contexts
+        chats.append(turn)
+
     session_data = {
         "session_id": session_id,
         "updated_at": datetime.now().isoformat(),
-        "chats": [{"prompt": p, "reply": r} for p, r in zip(prompts, replies)],
+        "chats": chats,
     }
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(session_data, f, indent=2, ensure_ascii=False)
 
     return session_id
+
+
+def delete_chat_session(session_id: str, folder_path: str = "past_chats") -> bool:
+    """Delete the JSON file for the given session_id. Returns True if deleted."""
+    file_path = os.path.join(folder_path, f"{session_id}.json")
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        return True
+    return False
 
 
 # ─── 2. Document preparation ──────────────────────────────────────────────────
