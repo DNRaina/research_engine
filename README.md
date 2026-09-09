@@ -29,11 +29,16 @@ The agent executes research tools directly through the **FastMCP Server** (`arxi
 
 ```
 research_agent/
+├── run_me.py           # Bootstrap launcher: verifies dirs, syncs indices, launches UI
 ├── app.py              # Main Streamlit Application invoking tools via FastMCP Server
+├── knowledge_base.py   # Persistent FAISS Knowledge Base with fingerprinting (books/)
+├── retriever.py        # Past Chat JSON Persistence & Gemini FAISS Vector RAG Engine
 ├── mcp_server.py       # FastMCP Server exposing research tool endpoints
 ├── mcp_tools.py        # Academic API Tool implementations (arXiv, Wikipedia, PubMed)
-├── retriever.py        # Past Chat JSON Persistence & Gemini FAISS Vector RAG Engine
-├── past_chats/         # Directory storing session JSON files
+├── books/              # Source PDFs / reference documents for local Knowledge Base
+├── scans/              # Persisted FAISS vector index files and fingerprint caches
+├── past_chats/         # Directory storing individual chat turns as JSON
+├── past_sessions/      # Directory storing full conversation sessions
 └── README.md           # Documentation
 ```
 
@@ -55,7 +60,13 @@ pip install streamlit langgraph langchain langchain-openai langchain-google-gena
 
 ### Running the Web Application
 
-Launch the Streamlit interface:
+To automatically verify directories, pre-build or sync any pending FAISS knowledge base indices, and launch the application:
+
+```bash
+python run_me.py
+```
+
+Alternatively, you can launch Streamlit directly:
 
 ```bash
 streamlit run app.py

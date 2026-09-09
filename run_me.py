@@ -44,8 +44,11 @@ print("=" * 60)
 print("Launching Streamlit app...")
 print("=" * 60)
 
-# Launch the Streamlit UI
-subprocess.run(
-    [sys.executable, "-m", "streamlit", "run", "app.py"],
-    check=True,
-)
+# Launch the Streamlit UI (forwarding any CLI arguments)
+try:
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", "app.py", *sys.argv[1:]],
+        check=True,
+    )
+except KeyboardInterrupt:
+    print("\n[Research Agent] Application stopped. Goodbye!")

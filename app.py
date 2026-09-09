@@ -23,6 +23,7 @@ from retriever import (
     save_chat_session,
     delete_chat_session,
     load_all_chat_sessions,
+    export_session_to_markdown,
     build_knowledge_base_if_needed,
     build_memory_index,
 )
@@ -290,13 +291,15 @@ def _session_date(s: Dict[str, Any]) -> str:
 
 def _load_session(s: Dict[str, Any]) -> None:
     chats = s.get("chats", [])
-    st.session_state["prompts"]    = [t.get("prompt", "") for t in chats]
-    st.session_state["replies"]    = [t.get("reply",  "") for t in chats]
-    st.session_state["session_id"] = s.get("session_id")
+    st.session_state["prompts"]       = [t.get("prompt", "") for t in chats]
+    st.session_state["replies"]       = [t.get("reply",  "") for t in chats]
+    st.session_state["contexts_list"] = [t.get("contexts", []) for t in chats]
+    st.session_state["session_id"]    = s.get("session_id")
 
 def _new_chat() -> None:
-    st.session_state["prompts"] = []
-    st.session_state["replies"] = []
+    st.session_state["prompts"]       = []
+    st.session_state["replies"]       = []
+    st.session_state["contexts_list"] = []
     st.session_state.pop("session_id", None)
 
 
@@ -513,7 +516,7 @@ def _build_graph() -> Any:
 research_graph = _build_graph()
 
 # ─── Session state defaults ───────────────────────────────────────────────────
-for _k in ("prompts", "replies"):
+for _k in ("prompts", "replies", "contexts_list"):
     if _k not in st.session_state:
         st.session_state[_k] = []
 
@@ -538,6 +541,25 @@ with st.sidebar:
         _new_chat()
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # Export report button (shown when active conversation has content)
+    if st.session_state.get("prompts"):
+        curr_id = st.session_state.get("session_id", "active")
+        report_md = export_session_to_markdown(
+            prompts=st.session_state["prompts"],
+            replies=st.session_state["replies"],
+            contexts_list=st.session_state.get("contexts_list"),
+            session_id=curr_id,
+            model_name=st.session_state.get("model_name"),
+        )
+        st.download_button(
+            label="📥 Export Report (.md)",
+            data=report_md,
+            file_name=f"research_report_{curr_id}.md",
+            mime="text/markdown",
+            key="export_report_btn",
+            use_container_width=True,
+        )
 
     # Session list
     sessions     = _all_sessions()
@@ -640,11 +662,16 @@ if not st.session_state["prompts"]:
             "structured research report. What would you like to explore?"
         )
 
-for u, r in zip(st.session_state["prompts"], st.session_state["replies"]):
+ctx_list = st.session_state.get("contexts_list", [])
+for idx, (u, r) in enumerate(zip(st.session_state["prompts"], st.session_state["replies"])):
     with st.chat_message("user"):
         st.write(u)
     with st.chat_message("assistant"):
         st.markdown(r)
+        if idx < len(ctx_list) and ctx_list[idx]:
+            with st.expander(f"📚 Retrieved Evidence ({len(ctx_list[idx])} sources)", expanded=False):
+                for c in ctx_list[idx]:
+                    st.markdown(c)
 
 prompt = st.chat_input("Ask JANE a research question…")
 
@@ -695,6 +722,7 @@ if prompt:
 
     st.session_state["prompts"].append(prompt)
     st.session_state["replies"].append(reply)
+    st.session_state.setdefault("contexts_list", []).append(captured_contexts)
 
     # Save session with retrieved context attached to this turn
     saved_id = save_chat_session(

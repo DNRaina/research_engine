@@ -29,6 +29,7 @@ __all__ = [
     "save_chat_session",
     "delete_chat_session",
     "load_all_chat_sessions",
+    "export_session_to_markdown",
     "prepare_chat_documents",
     "build_memory_index",
     "search_memory_index",
@@ -97,6 +98,46 @@ def delete_chat_session(session_id: str, folder_path: str = "past_chats") -> boo
         os.remove(file_path)
         return True
     return False
+
+
+def export_session_to_markdown(
+    prompts: List[str],
+    replies: List[str],
+    contexts_list: Optional[List[List[str]]] = None,
+    session_id: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> str:
+    """
+    Format a research conversation into a publication-ready Markdown dossier.
+    Includes timestamp, session metadata, questions, synthesized analysis, and evidence sources.
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sid = session_id or "adhoc_session"
+    lines = [
+        f"# JANE Research Dossier - Session `{sid}`",
+        f"**Generated:** {now_str}  ",
+        f"**Model:** {model_name or 'Gemini'}  ",
+        f"**Total Research Queries:** {len(prompts)}",
+        "\n---",
+    ]
+
+    for idx, (p, r) in enumerate(zip(prompts, replies), 1):
+        lines.append(f"\n## Research Query {idx}")
+        lines.append(f"> **Query:** {p}\n")
+        lines.append("### Synthesised Report\n")
+        lines.append(r.strip())
+
+        if contexts_list and idx - 1 < len(contexts_list) and contexts_list[idx - 1]:
+            ctxs = contexts_list[idx - 1]
+            lines.append(f"\n<details><summary><b>📚 Retrieved Evidence & Citations ({len(ctxs)} sources)</b></summary>\n")
+            for c in ctxs:
+                lines.append(f"{c}\n\n---\n")
+            lines.append("</details>\n")
+
+        lines.append("\n---")
+
+    lines.append("\n*Generated automatically by JANE (Just A Nuanced Engine).*")
+    return "\n".join(lines)
 
 
 # ─── 2. Document preparation ──────────────────────────────────────────────────
