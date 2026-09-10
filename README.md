@@ -2,13 +2,13 @@
 
 An intelligent, stateful **AI Research Agent** powered by **LangGraph**, **FastMCP (Model Context Protocol)**, **Gemini Embeddings**, and **Streamlit**.
 
-The agent executes research tools directly through the **FastMCP Server** (`arxiv_search`, `wikipedia_search`, `pubmed_search`) and maintains a cross-session RAG (Retrieval-Augmented Generation) memory store using **FAISS** and free **Gemini Embeddings**.
+The agent executes research tools directly through the **FastMCP Server** (`arxiv_search`, `wikipedia_search`, `pubmed_search`, `web_search`) and maintains a cross-session RAG (Retrieval-Augmented Generation) memory store using **FAISS** and free **Gemini Embeddings**.
 
 ---
 
 ## Key Features
 
-- **Stateful LangGraph Workflow**: Built on `StateGraph` using a `CurSession` TypedDict reducer (`prompts` & `replies`).
+- **Stateful LangGraph Workflow**: Three-node pipeline (`orchestrator -> retriever -> synthesiser`) built on `StateGraph`.
 - **FastMCP Server & Academic Tools Integration**:
   - **FastMCP Server Tool Execution**: `app.py` routes research requests through `mcp.call_tool(...)` on the `FastMCP` server instance.
   - **arXiv Tool**: Searches peer-reviewed computer science, AI, and math papers with author lists, abstracts, and direct PDF download links.
@@ -19,9 +19,18 @@ The agent executes research tools directly through the **FastMCP Server** (`arxi
   - Automatically exports chat turns as JSON files into `past_chats/`.
   - Indexes past research interactions using `GoogleGenerativeAIEmbeddings` (`models/text-embedding-004`) and `FAISS`.
   - Performs similarity searches over historical chats to provide cross-functional context awareness.
+- **Query Rewriting** *(new)*:
+  - Before routing to any search tool, the orchestrator node runs a lightweight LLM pass to rewrite the user's natural-language prompt into a concise, keyword-rich search query (max 12 words).
+  - Significantly improves retrieval quality for conversational, vague, or verbose inputs.
+  - Falls back transparently to the raw prompt if the API key is absent or the rewrite call fails.
+  - The rewritten query is shown next to the routing status line in the UI.
+- **Streaming LLM Responses** *(new)*:
+  - After retrieval completes, the synthesiser response is streamed token-by-token directly into the Streamlit UI using `ChatGoogleGenerativeAI.stream()`.
+  - The answer appears progressively, reducing perceived latency on long research reports.
+  - Gracefully falls back to a full-batch response if streaming is unavailable.
 - **Interactive Streamlit Interface**:
   - Real-time chat interface in `app.py`.
-  - Sidebar configuration for OpenAI API keys, Google/Gemini API keys, model selection (`gpt-4o-mini`, `gpt-4o`, `gpt-3.5-turbo`), and toggles for individual FastMCP research tools.
+  - Sidebar model selection (`gemini-2.5-flash-lite` default, plus 2.0-flash, 1.5-flash, 1.5-pro) and toggles for individual FastMCP research tools.
 
 ---
 
@@ -55,7 +64,7 @@ Ensure you have Python 3.10+ installed.
 Install the required Python dependencies:
 
 ```bash
-pip install streamlit langgraph langchain langchain-openai langchain-google-genai google-genai mcp langchain-mcp-adapters ddgs faiss-cpu python-dotenv
+pip install streamlit langgraph langchain langchain-google-genai google-genai mcp ddgs faiss-cpu python-dotenv
 ```
 
 ### Running the Web Application
@@ -84,9 +93,12 @@ python mcp_server.py
 
 ## Configuration & API Keys
 
-Configure your API keys via `.env` file or directly inside the Streamlit sidebar:
+Configure your API keys via a `.env` file in the project root:
 
-- **`OPENAI_API_KEY`**: Enables OpenAI model responses (`gpt-4o-mini`, `gpt-4o`, `gpt-3.5-turbo`).
-- **`GOOGLE_API_KEY` / `GEMINI_API_KEY`**: Enables free **Gemini Embeddings** (`models/text-embedding-004`) for past chat vector retrieval.
+```env
+GEMINI_API_KEY="AIzaSy..."
+```
 
-If no API keys are entered, the application automatically functions as a raw research collector, retrieving and displaying paper summaries, Wikipedia facts, and web results directly.
+- **`GOOGLE_API_KEY` / `GEMINI_API_KEY`**: Required for Gemini LLM synthesis, query rewriting, and Gemini Embeddings (`models/text-embedding-004`) for knowledge base and memory search.
+
+If no API key is set, the application functions as a raw research collector — retrieving and displaying paper summaries, Wikipedia facts, and web results directly, without LLM synthesis.

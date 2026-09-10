@@ -238,10 +238,11 @@ header[data-testid="stHeader"] { background: transparent; }
 
 # ─── State schema ─────────────────────────────────────────────────────────────
 class ResearchState(TypedDict):
-    prompts:   Annotated[List[str], operator.add]
-    replies:   Annotated[List[str], operator.add]
-    tool_plan: List[str]
-    contexts:  Annotated[List[str], operator.add]
+    prompts:       Annotated[List[str], operator.add]
+    replies:       Annotated[List[str], operator.add]
+    tool_plan:     List[str]
+    contexts:      Annotated[List[str], operator.add]
+    refined_query: str   # cleaned search query produced by the rewriter node
 
 
 # ─── Startup index builds ─────────────────────────────────────────────────────
@@ -353,12 +354,50 @@ _FACTUAL    = {"what is","what are","define","definition","explain","meaning","w
 _NEWS       = {"latest","recent","current","new","update","2024","2025","2026","news","today"}
 
 
+# ─── Query rewriter (Improvement 1) ─────────────────────────────────────────
+_REWRITE_PROMPT = (
+    "You are a search-query specialist. Given a user's research question, "
+    "produce one concise, keyword-rich search query (max 12 words, no filler "
+    "words, no punctuation) that will maximise retrieval from academic databases "
+    "and web search engines. Output ONLY the query string, nothing else."
+)
+
+def _rewrite_query(raw_query: str, key: str, model: str) -> str:
+    """
+    Use a lightweight LLM call to rewrite the user's prompt into a
+    terse, keyword-rich search query. Falls back to the raw prompt on error.
+    """
+    if not key:
+        return raw_query
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import SystemMessage, HumanMessage
+        llm = ChatGoogleGenerativeAI(
+            model=model, google_api_key=key,
+            temperature=0.0, max_retries=2,
+        )
+        resp = llm.invoke([
+            SystemMessage(content=_REWRITE_PROMPT),
+            HumanMessage(content=raw_query),
+        ])
+        refined = resp.content.strip().strip('"').strip("'")
+        return refined if refined else raw_query
+    except Exception as exc:
+        logger.warning("Query rewrite failed: %s", exc)
+        return raw_query
+
+
 # ─── Node 1: Orchestrator ─────────────────────────────────────────────────────
 def orchestrator_node(state: ResearchState) -> Dict[str, Any]:
     query  = state["prompts"][-1]
     ql     = query.lower()
     words  = set(ql.split())
     key    = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+    model  = st.session_state.get("model_name", "gemini-2.5-flash-lite")
+
+    # Rewrite the raw user query into a terse retrieval query
+    refined_query = _rewrite_query(query, key, model)
+    logger.info("Refined query: %r -> %r", query, refined_query)
 
     enabled = [tool for toggle, tool in TOGGLE_MAP.items()
                if st.session_state.get(toggle, SOURCE_DEFAULTS.get(toggle, True))]
@@ -380,12 +419,16 @@ def orchestrator_node(state: ResearchState) -> Dict[str, Any]:
     if "memory_search"         in scores: scores["memory_search"]         += 4
     if "knowledge_base_search" in scores: scores["knowledge_base_search"] += 3
 
-    return {"tool_plan": sorted(enabled, key=lambda t: scores.get(t,0), reverse=True)}
+    return {
+        "tool_plan":     sorted(enabled, key=lambda t: scores.get(t, 0), reverse=True),
+        "refined_query": refined_query,
+    }
 
 
 # ─── Node 2: Parallel Retriever ───────────────────────────────────────────────
 def retriever_node(state: ResearchState) -> Dict[str, Any]:
-    query     = state["prompts"][-1]
+    # Use the refined query for tools; fall back to raw prompt if rewriter was skipped
+    query     = state.get("refined_query") or state["prompts"][-1]
     tool_plan = state.get("tool_plan", [])
     key       = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
 
@@ -461,11 +504,25 @@ def _get_llm(model_name: str, google_key: str):
     )
 
 
+def _build_messages(state: ResearchState, ctx_block: str) -> list:
+    """Assemble the full message history for the LLM call."""
+    messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    messages.append(HumanMessage(content=ctx_block))
+    for p, r in zip(state["prompts"][:-1], state["replies"]):
+        messages.append(HumanMessage(content=p))
+        messages.append(AIMessage(content=r))
+    messages.append(HumanMessage(content=state["prompts"][-1]))
+    return messages
+
+
 def synthesiser_node(state: ResearchState) -> Dict[str, Any]:
-    query    = state["prompts"][-1]
+    """
+    Node 3 — synthesises retrieved context into a structured Markdown report.
+    Stores the full reply text in state; streaming is handled in the UI layer.
+    """
     contexts = state.get("contexts", [])
     key      = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    model    = st.session_state.get("model_name", "gemini-2.0-flash")
+    model    = st.session_state.get("model_name", "gemini-2.5-flash-lite")
 
     ctx_block = (
         f"## Retrieved Context ({len(contexts)} source(s))\n\n"
@@ -479,13 +536,8 @@ def synthesiser_node(state: ResearchState) -> Dict[str, Any]:
             "---\n\n" + ctx_block
         ]}
     try:
-        llm = _get_llm(model, key)
-        messages = [SystemMessage(content=SYSTEM_PROMPT)]
-        messages.append(HumanMessage(content=ctx_block))
-        for p, r in zip(state["prompts"][:-1], state["replies"]):
-            messages.append(HumanMessage(content=p))
-            messages.append(AIMessage(content=r))
-        messages.append(HumanMessage(content=query))
+        llm      = _get_llm(model, key)
+        messages = _build_messages(state, ctx_block)
         response = llm.invoke(messages)
         return {"replies": [response.content]}
     except Exception as exc:
@@ -553,7 +605,7 @@ with st.sidebar:
             model_name=st.session_state.get("model_name"),
         )
         st.download_button(
-            label="📥 Export Report (.md)",
+            label="Export Report (.md)",
             data=report_md,
             file_name=f"research_report_{curr_id}.md",
             mime="text/markdown",
@@ -598,7 +650,7 @@ with st.sidebar:
     st.markdown('<p class="sidebar-label">Model</p>', unsafe_allow_html=True)
     model_choice = st.selectbox(
         "model", label_visibility="collapsed",
-        options=["gemini-2.0-flash","gemini-2.0-flash-lite","gemini-1.5-flash","gemini-1.5-pro"],
+        options=["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"],
         index=0,
     )
     st.session_state["model_name"] = model_choice
@@ -669,7 +721,7 @@ for idx, (u, r) in enumerate(zip(st.session_state["prompts"], st.session_state["
     with st.chat_message("assistant"):
         st.markdown(r)
         if idx < len(ctx_list) and ctx_list[idx]:
-            with st.expander(f"📚 Retrieved Evidence ({len(ctx_list[idx])} sources)", expanded=False):
+            with st.expander(f"Retrieved Evidence ({len(ctx_list[idx])} sources)", expanded=False):
                 for c in ctx_list[idx]:
                     st.markdown(c)
 
@@ -690,35 +742,83 @@ if prompt:
     captured_contexts: List[str] = []
 
     with st.chat_message("assistant"):
-        status_box = st.empty()
+        status_box  = st.empty()
+        stream_box  = st.empty()
 
         for chunk in research_graph.stream(inputs, stream_mode="updates"):
             node = next(iter(chunk))
             data = chunk[node]
 
             if node == "orchestrator":
-                plan   = data.get("tool_plan", [])
-                labels = ", ".join(TOOL_LABELS.get(t, t) for t in plan)
+                plan    = data.get("tool_plan", [])
+                refined = data.get("refined_query", "")
+                labels  = ", ".join(TOOL_LABELS.get(t, t) for t in plan)
+                rewrite_hint = (
+                    f" <span style='color:#484f58;font-size:0.73rem'>(search: {refined})</span>"
+                    if refined and refined != prompt else ""
+                )
                 status_box.markdown(
                     f"**Routing** — {len(plan)} source(s): "
-                    f"<span style='color:#484f58;font-size:0.76rem'>{labels}</span>",
+                    f"<span style='color:#484f58;font-size:0.76rem'>{labels}</span>"
+                    f"{rewrite_hint}",
                     unsafe_allow_html=True,
                 )
             elif node == "retriever":
                 captured_contexts = data.get("contexts", [])
                 n = len(captured_contexts)
-                status_box.markdown(f"**Gathering** — {n} source(s) responded. Synthesising…")
+                status_box.markdown(f"**Gathering** — {n} source(s) responded. Synthesising...")
             elif node == "synthesiser":
                 replies = data.get("replies", [])
                 if replies:
                     reply = replies[-1]
 
         status_box.empty()
+
+        # Improvement 2 — Stream the reply token-by-token for perceived responsiveness.
+        # If streaming is unavailable (e.g. non-streaming model), fall back to st.markdown.
         if reply:
-            st.markdown(reply)
+            key   = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            model = st.session_state.get("model_name", "gemini-2.5-flash-lite")
+            if key:
+                try:
+                    from langchain_google_genai import ChatGoogleGenerativeAI
+                    contexts = captured_contexts
+                    ctx_block = (
+                        f"## Retrieved Context ({len(contexts)} source(s))\n\n"
+                        + "\n\n---\n\n".join(contexts)
+                        if contexts else "No external research context was retrieved."
+                    )
+                    stream_llm = ChatGoogleGenerativeAI(
+                        model=model, google_api_key=key,
+                        temperature=0.35, max_retries=2,
+                    )
+                    # Re-build messages for streaming (same as synthesiser_node)
+                    stream_msgs = [SystemMessage(content=SYSTEM_PROMPT)]
+                    stream_msgs.append(HumanMessage(content=ctx_block))
+                    for p_hist, r_hist in zip(
+                        st.session_state["prompts"], st.session_state["replies"]
+                    ):
+                        stream_msgs.append(HumanMessage(content=p_hist))
+                        stream_msgs.append(AIMessage(content=r_hist))
+                    stream_msgs.append(HumanMessage(content=prompt))
+
+                    streamed_tokens: List[str] = []
+                    with stream_box:
+                        placeholder = st.empty()
+                        for tok in stream_llm.stream(stream_msgs):
+                            streamed_tokens.append(tok.content)
+                            placeholder.markdown("".join(streamed_tokens) + " |")
+                        placeholder.markdown("".join(streamed_tokens))
+                    # Use the streamed text as the canonical reply
+                    reply = "".join(streamed_tokens)
+                except Exception as stream_exc:
+                    logger.warning("Streaming fell back to batch: %s", stream_exc)
+                    stream_box.markdown(reply)
+            else:
+                stream_box.markdown(reply)
         else:
             reply = "No response generated. Check your API key and connection."
-            st.warning(reply)
+            stream_box.warning(reply)
 
     st.session_state["prompts"].append(prompt)
     st.session_state["replies"].append(reply)

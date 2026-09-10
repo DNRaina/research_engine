@@ -129,7 +129,7 @@ def export_session_to_markdown(
 
         if contexts_list and idx - 1 < len(contexts_list) and contexts_list[idx - 1]:
             ctxs = contexts_list[idx - 1]
-            lines.append(f"\n<details><summary><b>📚 Retrieved Evidence & Citations ({len(ctxs)} sources)</b></summary>\n")
+            lines.append(f"\n<details><summary><b>Retrieved Evidence & Citations ({len(ctxs)} sources)</b></summary>\n")
             for c in ctxs:
                 lines.append(f"{c}\n\n---\n")
             lines.append("</details>\n")
