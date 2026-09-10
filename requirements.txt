@@ -1,0 +1,11 @@
+python-dotenv
+streamlit
+mcp
+langchain-core
+langchain-text-splitters
+langchain-community
+langchain-google-genai
+langgraph
+faiss-cpu
+pypdf
+numpy
