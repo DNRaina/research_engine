@@ -1,54 +1,70 @@
 """
 run_me.py
 ---------
-Bootstrap script. Creates required directories, pre-builds the knowledge base
-index from books/ into scans/, then launches the Streamlit app.
+Production bootstrap and launcher script.
+Initializes runtime environment, verifies configurations, runs startup checks,
+and launches the Streamlit research interface.
 """
 
-import os
-import subprocess
 import sys
-
+import subprocess
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Ensure required directories exist
-for folder in ["past_chats", "books", "scans", "past_sessions"]:
-    os.makedirs(folder, exist_ok=True)
+from config import settings
+from logger import app_logger
 
-# Pre-build knowledge base index (skipped if already up-to-date)
-print("=" * 60)
-print("Research Agent — startup checks")
-print("=" * 60)
+# Ensure all runtime storage paths are created
+settings.ensure_directories()
+
+print("=" * 65)
+print(f"  {settings.app_name} v{settings.app_version} — Startup Sequence")
+print("=" * 65)
+
+# Diagnostic CLI flag support
+if "--check" in sys.argv or "--diagnostics" in sys.argv:
+    from health import run_diagnostics
+    sys.exit(0 if run_diagnostics() else 1)
 
 try:
     from knowledge_base import build_knowledge_base_if_needed
     from retriever import build_memory_index
 
     kb_status = build_knowledge_base_if_needed(
-        books_dir="books",
-        scans_dir="scans",
+        books_dir=settings.books_dir,
+        scans_dir=settings.scans_dir,
     )
-    print(f"Knowledge base : {kb_status}")
+    print(f"Knowledge Base Index : {kb_status}")
 
     mem_status = build_memory_index(
-        folder_path="past_chats",
-        scans_dir="scans",
+        folder_path=settings.past_chats_dir,
+        scans_dir=settings.scans_dir,
     )
-    print(f"Memory index   : {mem_status}")
-except Exception as e:
-    print(f"Knowledge base build skipped: {e}")
+    print(f"Memory Index Status  : {mem_status}")
 
-print("=" * 60)
-print("Launching Streamlit app...")
-print("=" * 60)
+except Exception as exc:
+    app_logger.warning(f"Startup index build error: {exc}")
 
-# Launch the Streamlit UI (forwarding any CLI arguments)
+print("=" * 65)
+print("Launching Streamlit Application...")
+print("=" * 65)
+
+cmd = [
+    sys.executable,
+    "-m",
+    "streamlit",
+    "run",
+    "app.py",
+    "--browser.gatherUsageStats=false",
+    "--server.fileWatcherType=none",
+    *sys.argv[1:],
+]
+
 try:
-    subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", "app.py", *sys.argv[1:]],
-        check=True,
-    )
+    subprocess.run(cmd, check=True)
 except KeyboardInterrupt:
-    print("\n[Research Agent] Application stopped. Goodbye!")
+    print("\n[JANE] Application stopped by user. Goodbye!")
+except Exception as exc:
+    app_logger.error(f"Failed to launch Streamlit application: {exc}")
+    sys.exit(1)

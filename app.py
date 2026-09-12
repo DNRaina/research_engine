@@ -1,15 +1,18 @@
 """
 app.py — JANE (Just A Nuanced Engine)
 --------------------------------------
-Three-node LangGraph multi-agent pipeline.
-API key read from .env only. Source toggles live in the main chat area.
-Conversation history (with retrieved context) shown at the top of the sidebar.
+Production-grade multi-agent research engine built with LangGraph and Streamlit.
+Features:
+  - Single-pass real-time token streaming (zero duplicate LLM calls)
+  - Parallel resilient retrieval via FastMCP tools
+  - Comprehensive telemetry & per-source latency tracking
+  - Incremental FAISS conversational memory
+  - Enterprise dark theme UI
 """
 
+import time
 import operator
-import os
 import asyncio
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 from typing_extensions import Annotated, TypedDict
@@ -19,6 +22,8 @@ from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 
+from config import settings
+from logger import app_logger
 from retriever import (
     save_chat_session,
     delete_chat_session,
@@ -30,20 +35,20 @@ from retriever import (
 from mcp_server import mcp
 
 load_dotenv()
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
+settings.ensure_directories()
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+# ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="JANE",
+    page_title="JANE — Research Agent",
+    page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── CSS ──────────────────────────────────────────────────────────────────────
+# ─── CSS Design System ────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
@@ -143,16 +148,17 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 /* Status pills */
 .pill {
     display: inline-block;
-    padding: 2px 9px;
+    padding: 2px 8px;
     border-radius: 20px;
-    font-size: 0.69rem;
+    font-size: 0.68rem;
     font-weight: 500;
-    margin-top: 4px;
+    margin: 2px 3px 2px 0;
 }
 .pill-green  { background:#0d2a1f; color:#3fb950; border:1px solid #238636; }
 .pill-amber  { background:#271d0a; color:#d29922; border:1px solid #9e6a03; }
 .pill-blue   { background:#0c1a2e; color:#58a6ff; border:1px solid #1f6feb; }
 .pill-red    { background:#2d0d0d; color:#f85149; border:1px solid #da3633; }
+.pill-gray   { background:#161b22; color:#8b949e; border:1px solid #30363d; }
 
 /* Main header */
 .app-header {
@@ -175,36 +181,15 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     color: #484f58;
 }
 
-/* Source toggles strip */
-.source-strip {
+/* Telemetry Badge */
+.telemetry-tag {
+    font-size: 0.71rem;
+    color: #6e7681;
+    margin-top: 0.4rem;
     display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-bottom: 0.8rem;
-    padding: 8px 12px;
-    background: #0d1117;
-    border: 1px solid #21262d;
-    border-radius: 8px;
-}
-.src-chip {
-    display: inline-flex;
     align-items: center;
-    gap: 4px;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 0.72rem;
-    font-weight: 500;
-    cursor: pointer;
-    border: 1px solid #30363d;
-    background: transparent;
-    color: #8b949e;
-    transition: all 0.12s ease;
-    user-select: none;
-}
-.src-chip.on {
-    background: #0c1a2e;
-    border-color: #1f6feb;
-    color: #58a6ff;
+    gap: 0.6rem;
+    font-family: monospace;
 }
 
 /* No-key banner */
@@ -230,48 +215,55 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     margin-top: 1.1rem;
 }
 
-/* Hide Streamlit chrome */
 #MainMenu, footer { visibility: hidden; }
 header[data-testid="stHeader"] { background: transparent; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── State schema ─────────────────────────────────────────────────────────────
+
+# ─── State Schema ─────────────────────────────────────────────────────────────
 class ResearchState(TypedDict):
-    prompts:       Annotated[List[str], operator.add]
-    replies:       Annotated[List[str], operator.add]
-    tool_plan:     List[str]
-    contexts:      Annotated[List[str], operator.add]
-    refined_query: str   # cleaned search query produced by the rewriter node
+    prompts: Annotated[List[str], operator.add]
+    replies: Annotated[List[str], operator.add]
+    tool_plan: List[str]
+    contexts: Annotated[List[str], operator.add]
+    refined_query: str
+    telemetry: Dict[str, Any]
 
 
-# ─── Startup index builds ─────────────────────────────────────────────────────
+# ─── Startup Index Builds ─────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _init_indices() -> Dict[str, str]:
-    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    key = settings.api_key
     out: Dict[str, str] = {}
     try:
         out["kb"] = build_knowledge_base_if_needed(
-            books_dir="books", scans_dir="scans", google_api_key=key
+            books_dir=settings.books_dir,
+            scans_dir=settings.scans_dir,
+            google_api_key=key,
         )
     except Exception as exc:
         out["kb"] = f"error:{exc}"
     try:
         out["memory"] = build_memory_index(
-            google_api_key=key, folder_path="past_chats", scans_dir="scans"
+            google_api_key=key,
+            folder_path=settings.past_chats_dir,
+            scans_dir=settings.scans_dir,
         )
     except Exception as exc:
         out["memory"] = f"error:{exc}"
     return out
 
+
 idx_status = _init_indices()
 
 
-# ─── Session helpers ──────────────────────────────────────────────────────────
+# ─── Session Helpers ──────────────────────────────────────────────────────────
 def _all_sessions() -> List[Dict[str, Any]]:
-    sessions = load_all_chat_sessions("past_chats")
+    sessions = load_all_chat_sessions(settings.past_chats_dir)
     sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
     return sessions
+
 
 def _session_title(s: Dict[str, Any]) -> str:
     chats = s.get("chats", [])
@@ -279,6 +271,7 @@ def _session_title(s: Dict[str, Any]) -> str:
         first = chats[0].get("prompt", "")
         return (first[:50] + "…") if len(first) > 50 else first
     return s.get("session_id", "Untitled")
+
 
 def _session_date(s: Dict[str, Any]) -> str:
     ts = s.get("updated_at", "")
@@ -290,71 +283,79 @@ def _session_date(s: Dict[str, Any]) -> str:
             pass
     return ""
 
+
 def _load_session(s: Dict[str, Any]) -> None:
     chats = s.get("chats", [])
-    st.session_state["prompts"]       = [t.get("prompt", "") for t in chats]
-    st.session_state["replies"]       = [t.get("reply",  "") for t in chats]
+    st.session_state["prompts"] = [t.get("prompt", "") for t in chats]
+    st.session_state["replies"] = [t.get("reply", "") for t in chats]
     st.session_state["contexts_list"] = [t.get("contexts", []) for t in chats]
-    st.session_state["session_id"]    = s.get("session_id")
+    st.session_state["session_id"] = s.get("session_id")
+    st.session_state["turn_metrics"] = []
+
 
 def _new_chat() -> None:
-    st.session_state["prompts"]       = []
-    st.session_state["replies"]       = []
+    st.session_state["prompts"] = []
+    st.session_state["replies"] = []
     st.session_state["contexts_list"] = []
+    st.session_state["turn_metrics"] = []
     st.session_state.pop("session_id", None)
 
 
-# ─── Source toggle defaults ───────────────────────────────────────────────────
+# ─── Source Toggle Defaults ───────────────────────────────────────────────────
 SOURCE_DEFAULTS: Dict[str, bool] = {
-    "enable_kb":     True,
+    "enable_kb": True,
     "enable_memory": True,
-    "enable_arxiv":  True,
-    "enable_wiki":   True,
+    "enable_arxiv": True,
+    "enable_wiki": True,
     "enable_pubmed": False,
-    "enable_web":    True,
+    "enable_web": True,
 }
 for _k, _v in SOURCE_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
 
-# ─── MCP tool invocation ──────────────────────────────────────────────────────
-def _invoke_tool(tool_name: str, args: Dict[str, Any]) -> tuple[str, str]:
+# ─── MCP Tool Invocation ──────────────────────────────────────────────────────
+def _invoke_tool(tool_name: str, args: Dict[str, Any]) -> tuple[str, str, float]:
+    t0 = time.perf_counter()
     try:
         blocks, _ = asyncio.run(mcp.call_tool(tool_name, args))
-        return tool_name, (blocks[0].text if blocks else "")
+        res = blocks[0].text if blocks else ""
+        return tool_name, res, time.perf_counter() - t0
     except Exception as exc:
-        logger.warning("Tool %s: %s", tool_name, exc)
-        return tool_name, ""
+        app_logger.warning(f"Tool {tool_name} error: {exc}")
+        return tool_name, "", time.perf_counter() - t0
 
 
-# ─── Tool metadata ────────────────────────────────────────────────────────────
+# ─── Tool Metadata & Heuristics ───────────────────────────────────────────────
 TOOL_LABELS: Dict[str, str] = {
     "knowledge_base_search": "Knowledge Base",
-    "memory_search":         "Memory",
-    "arxiv_search":          "arXiv",
-    "wikipedia_search":      "Wikipedia",
-    "pubmed_search":         "PubMed",
-    "web_search":            "Web",
+    "memory_search": "Memory",
+    "arxiv_search": "arXiv",
+    "wikipedia_search": "Wikipedia",
+    "pubmed_search": "PubMed",
+    "web_search": "Web",
 }
 TOGGLE_MAP: Dict[str, str] = {
-    "enable_kb":     "knowledge_base_search",
+    "enable_kb": "knowledge_base_search",
     "enable_memory": "memory_search",
-    "enable_arxiv":  "arxiv_search",
-    "enable_wiki":   "wikipedia_search",
+    "enable_arxiv": "arxiv_search",
+    "enable_wiki": "wikipedia_search",
     "enable_pubmed": "pubmed_search",
-    "enable_web":    "web_search",
+    "enable_web": "web_search",
 }
 
-_ACADEMIC   = {"research","paper","study","journal","arxiv","model","algorithm",
-               "method","theorem","proof","experiment","dataset","neural","ml","ai"}
-_BIOMEDICAL = {"drug","disease","clinical","patient","gene","protein","therapy",
-               "medicine","health","symptom","treatment","diagnosis"}
-_FACTUAL    = {"what is","what are","define","definition","explain","meaning","who is","when was"}
-_NEWS       = {"latest","recent","current","new","update","2024","2025","2026","news","today"}
+_ACADEMIC = {
+    "research", "paper", "study", "journal", "arxiv", "model", "algorithm",
+    "method", "theorem", "proof", "experiment", "dataset", "neural", "ml", "ai"
+}
+_BIOMEDICAL = {
+    "drug", "disease", "clinical", "patient", "gene", "protein", "therapy",
+    "medicine", "health", "symptom", "treatment", "diagnosis"
+}
+_FACTUAL = {"what is", "what are", "define", "definition", "explain", "meaning", "who is", "when was"}
+_NEWS = {"latest", "recent", "current", "new", "update", "news", "today"}
 
-
-# ─── Query rewriter (Improvement 1) ─────────────────────────────────────────
 _REWRITE_PROMPT = (
     "You are a search-query specialist. Given a user's research question, "
     "produce one concise, keyword-rich search query (max 12 words, no filler "
@@ -362,19 +363,19 @@ _REWRITE_PROMPT = (
     "and web search engines. Output ONLY the query string, nothing else."
 )
 
+
 def _rewrite_query(raw_query: str, key: str, model: str) -> str:
-    """
-    Use a lightweight LLM call to rewrite the user's prompt into a
-    terse, keyword-rich search query. Falls back to the raw prompt on error.
-    """
+    """Use a lightweight LLM call to rewrite the prompt into a terse retrieval query."""
     if not key:
         return raw_query
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        from langchain_core.messages import SystemMessage, HumanMessage
         llm = ChatGoogleGenerativeAI(
-            model=model, google_api_key=key,
-            temperature=0.0, max_retries=2,
+            model=model,
+            google_api_key=key,
+            temperature=0.0,
+            max_retries=1,
+            timeout=8.0,
         )
         resp = llm.invoke([
             SystemMessage(content=_REWRITE_PROMPT),
@@ -383,60 +384,70 @@ def _rewrite_query(raw_query: str, key: str, model: str) -> str:
         refined = resp.content.strip().strip('"').strip("'")
         return refined if refined else raw_query
     except Exception as exc:
-        logger.warning("Query rewrite failed: %s", exc)
+        app_logger.warning(f"Query rewrite failed: {exc}")
         return raw_query
 
 
 # ─── Node 1: Orchestrator ─────────────────────────────────────────────────────
 def orchestrator_node(state: ResearchState) -> Dict[str, Any]:
-    query  = state["prompts"][-1]
-    ql     = query.lower()
-    words  = set(ql.split())
-    key    = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
-    model  = st.session_state.get("model_name", "gemini-2.5-flash-lite")
+    t0 = time.perf_counter()
+    query = state["prompts"][-1]
+    ql = query.lower()
+    words = set(ql.split())
+    key = settings.api_key
+    model = st.session_state.get("model_name", settings.default_model)
 
-    # Rewrite the raw user query into a terse retrieval query
     refined_query = _rewrite_query(query, key, model)
-    logger.info("Refined query: %r -> %r", query, refined_query)
 
-    enabled = [tool for toggle, tool in TOGGLE_MAP.items()
-               if st.session_state.get(toggle, SOURCE_DEFAULTS.get(toggle, True))]
+    enabled = [
+        tool for toggle, tool in TOGGLE_MAP.items()
+        if st.session_state.get(toggle, SOURCE_DEFAULTS.get(toggle, True))
+    ]
     if not key:
-        enabled = [t for t in enabled if t not in ("knowledge_base_search","memory_search")]
+        enabled = [t for t in enabled if t not in ("knowledge_base_search", "memory_search")]
 
     scores: Dict[str, int] = {t: 10 for t in enabled}
     if words & _ACADEMIC:
-        for t in ("knowledge_base_search","arxiv_search"):
-            if t in scores: scores[t] += 8
+        for t in ("knowledge_base_search", "arxiv_search"):
+            if t in scores:
+                scores[t] += 8
     if words & _BIOMEDICAL:
-        for t in ("pubmed_search","arxiv_search"):
-            if t in scores: scores[t] += 8
+        for t in ("pubmed_search", "arxiv_search"):
+            if t in scores:
+                scores[t] += 8
     if any(k in ql for k in _FACTUAL):
-        for t in ("wikipedia_search","knowledge_base_search"):
-            if t in scores: scores[t] += 6
+        for t in ("wikipedia_search", "knowledge_base_search"):
+            if t in scores:
+                scores[t] += 6
     if words & _NEWS:
-        if "web_search" in scores: scores["web_search"] += 8
-    if "memory_search"         in scores: scores["memory_search"]         += 4
-    if "knowledge_base_search" in scores: scores["knowledge_base_search"] += 3
+        if "web_search" in scores:
+            scores["web_search"] += 8
+    if "memory_search" in scores:
+        scores["memory_search"] += 4
+    if "knowledge_base_search" in scores:
+        scores["knowledge_base_search"] += 3
+
+    tool_plan = sorted(enabled, key=lambda t: scores.get(t, 0), reverse=True)
+    latency = time.perf_counter() - t0
 
     return {
-        "tool_plan":     sorted(enabled, key=lambda t: scores.get(t, 0), reverse=True),
+        "tool_plan": tool_plan,
         "refined_query": refined_query,
+        "telemetry": {"orchestrator_latency": latency},
     }
 
 
 # ─── Node 2: Parallel Retriever ───────────────────────────────────────────────
 def retriever_node(state: ResearchState) -> Dict[str, Any]:
-    # Use the refined query for tools; fall back to raw prompt if rewriter was skipped
-    query     = state.get("refined_query") or state["prompts"][-1]
+    t0 = time.perf_counter()
+    query = state.get("refined_query") or state["prompts"][-1]
     tool_plan = state.get("tool_plan", [])
-    key       = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+    key = settings.api_key
 
     calls: List[tuple[str, Dict]] = []
     for tool in tool_plan:
-        if tool in ("knowledge_base_search","memory_search"):
-            calls.append((tool, {"query": query, "api_key": key,
-                                 "top_k": 4 if tool == "knowledge_base_search" else 3}))
+        if tool in ("knowledge_base_search", "memory_search"):
+            calls.append((tool, {"query": query, "api_key": key, "top_k": 4 if tool == "knowledge_base_search" else 3}))
         elif tool == "arxiv_search":
             calls.append((tool, {"query": query, "max_results": 3}))
         elif tool == "wikipedia_search":
@@ -447,24 +458,54 @@ def retriever_node(state: ResearchState) -> Dict[str, Any]:
             calls.append((tool, {"query": query, "max_results": 3}))
 
     if not calls:
-        return {"contexts": []}
+        return {"contexts": [], "telemetry": {"retriever_latency": 0.0, "sources": []}}
 
     contexts: List[str] = []
+    source_stats = []
+
     with ThreadPoolExecutor(max_workers=min(len(calls), 8)) as ex:
         futures = {ex.submit(_invoke_tool, n, a): n for n, a in calls}
-        for future in as_completed(futures, timeout=60):
+        for future in as_completed(futures, timeout=settings.http_timeout_s + 5.0):
             tool_name = futures[future]
             try:
-                _, result = future.result()
-                if result and result.strip() and len(result) > 30:
-                    contexts.append(f"### {TOOL_LABELS.get(tool_name, tool_name)}\n{result}")
+                _, result, duration = future.result()
+                has_content = bool(result and result.strip() and len(result) > 30)
+                if has_content:
+                    label = TOOL_LABELS.get(tool_name, tool_name)
+                    contexts.append(f"### {label}\n{result}")
+                source_stats.append({
+                    "tool": tool_name,
+                    "label": TOOL_LABELS.get(tool_name, tool_name),
+                    "duration": duration,
+                    "success": has_content,
+                })
             except Exception as exc:
-                logger.warning("Future %s: %s", tool_name, exc)
+                app_logger.warning(f"Future error for {tool_name}: {exc}")
 
-    return {"contexts": contexts}
+    retriever_latency = time.perf_counter() - t0
+    return {
+        "contexts": contexts,
+        "telemetry": {
+            "retriever_latency": retriever_latency,
+            "sources": source_stats,
+        },
+    }
 
 
-# ─── Node 3: Synthesiser ──────────────────────────────────────────────────────
+# ─── Graph Compilation ────────────────────────────────────────────────────────
+def _build_graph() -> Any:
+    g = StateGraph(ResearchState)
+    g.add_node("orchestrator", orchestrator_node)
+    g.add_node("retriever", retriever_node)
+    g.add_edge(START, "orchestrator")
+    g.add_edge("orchestrator", "retriever")
+    g.add_edge("retriever", END)
+    return g.compile()
+
+
+research_graph = _build_graph()
+
+# ─── Synthesiser Prompts & Helpers ────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 You are JANE — Just A Nuanced Engine — an expert AI Research Assistant.
 
@@ -499,76 +540,26 @@ Brief synthesis. Note limitations and suggest follow-up directions.
 def _get_llm(model_name: str, google_key: str):
     from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(
-        model=model_name, google_api_key=google_key,
-        temperature=0.35, max_retries=3,
+        model=model_name,
+        google_api_key=google_key,
+        temperature=0.35,
+        max_retries=2,
     )
 
 
-def _build_messages(state: ResearchState, ctx_block: str) -> list:
-    """Assemble the full message history for the LLM call."""
+def _build_messages(prompts: List[str], replies: List[str], ctx_block: str, current_prompt: str) -> list:
+    """Assemble the conversation and context message history."""
     messages = [SystemMessage(content=SYSTEM_PROMPT)]
     messages.append(HumanMessage(content=ctx_block))
-    for p, r in zip(state["prompts"][:-1], state["replies"]):
+    for p, r in zip(prompts, replies):
         messages.append(HumanMessage(content=p))
         messages.append(AIMessage(content=r))
-    messages.append(HumanMessage(content=state["prompts"][-1]))
+    messages.append(HumanMessage(content=current_prompt))
     return messages
 
 
-def synthesiser_node(state: ResearchState) -> Dict[str, Any]:
-    """
-    Node 3 — synthesises retrieved context into a structured Markdown report.
-    Stores the full reply text in state; streaming is handled in the UI layer.
-    """
-    contexts = state.get("contexts", [])
-    key      = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    model    = st.session_state.get("model_name", "gemini-2.5-flash-lite")
-
-    ctx_block = (
-        f"## Retrieved Context ({len(contexts)} source(s))\n\n"
-        + "\n\n---\n\n".join(contexts)
-        if contexts else "No external research context was retrieved."
-    )
-
-    if not key:
-        return {"replies": [
-            "> **No Gemini API key.** Add `GOOGLE_API_KEY=...` to `.env` and restart.\n\n"
-            "---\n\n" + ctx_block
-        ]}
-    try:
-        llm      = _get_llm(model, key)
-        messages = _build_messages(state, ctx_block)
-        response = llm.invoke(messages)
-        return {"replies": [response.content]}
-    except Exception as exc:
-        err = str(exc).lower()
-        if "api key" in err or "invalid" in err or "unauthorized" in err:
-            msg = "**Auth error:** Gemini API key invalid or expired."
-        elif "quota" in err or "429" in err or "rate" in err:
-            msg = "**Rate limit:** Gemini quota exceeded — wait and retry."
-        elif "network" in err or "connection" in err:
-            msg = "**Network error:** Could not reach Gemini API."
-        else:
-            msg = f"**Error:** `{str(exc)}`"
-        return {"replies": [f"{msg}\n\n---\n\n{ctx_block}"]}
-
-
-# ─── Graph ────────────────────────────────────────────────────────────────────
-def _build_graph() -> Any:
-    g = StateGraph(ResearchState)
-    g.add_node("orchestrator", orchestrator_node)
-    g.add_node("retriever",    retriever_node)
-    g.add_node("synthesiser",  synthesiser_node)
-    g.add_edge(START,          "orchestrator")
-    g.add_edge("orchestrator", "retriever")
-    g.add_edge("retriever",    "synthesiser")
-    g.add_edge("synthesiser",  END)
-    return g.compile()
-
-research_graph = _build_graph()
-
-# ─── Session state defaults ───────────────────────────────────────────────────
-for _k in ("prompts", "replies", "contexts_list"):
+# ─── Session State Defaults ───────────────────────────────────────────────────
+for _k in ("prompts", "replies", "contexts_list", "turn_metrics"):
     if _k not in st.session_state:
         st.session_state[_k] = []
 
@@ -578,23 +569,19 @@ with st.sidebar:
     st.markdown("## JANE")
     st.markdown("---")
 
-    # ── Conversations (TOP) ───────────────────────────────────────────────────
     st.markdown('<p class="sidebar-label">Conversations</p>', unsafe_allow_html=True)
 
-    # Search filter
     search_q = st.text_input(
         "search", placeholder="Search…",
         label_visibility="collapsed", key="sess_search"
     )
 
-    # New chat button
     st.markdown('<div class="new-chat-btn">', unsafe_allow_html=True)
     if st.button("+ New Chat", key="new_chat_btn", use_container_width=True):
         _new_chat()
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Export report button (shown when active conversation has content)
     if st.session_state.get("prompts"):
         curr_id = st.session_state.get("session_id", "active")
         report_md = export_session_to_markdown(
@@ -605,24 +592,23 @@ with st.sidebar:
             model_name=st.session_state.get("model_name"),
         )
         st.download_button(
-            label="Export Report (.md)",
+            label="Export Dossier (.md)",
             data=report_md,
-            file_name=f"research_report_{curr_id}.md",
+            file_name=f"research_dossier_{curr_id}.md",
             mime="text/markdown",
             key="export_report_btn",
             use_container_width=True,
         )
 
-    # Session list
-    sessions     = _all_sessions()
-    current_sid  = st.session_state.get("session_id")
-    sq           = (search_q or "").strip().lower()
-    filtered     = [s for s in sessions if not sq or sq in _session_title(s).lower()]
+    sessions = _all_sessions()
+    current_sid = st.session_state.get("session_id")
+    sq = (search_q or "").strip().lower()
+    filtered = [s for s in sessions if not sq or sq in _session_title(s).lower()]
 
     for sess in filtered:
-        sid      = sess.get("session_id", "")
-        title    = _session_title(sess)
-        date     = _session_date(sess)
+        sid = sess.get("session_id", "")
+        title = _session_title(sess)
+        date = _session_date(sess)
         is_active = sid == current_sid
 
         col_title, col_del = st.columns([0.86, 0.14])
@@ -646,30 +632,53 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Model Selection ───────────────────────────────────────────────────────
     st.markdown('<p class="sidebar-label">Model</p>', unsafe_allow_html=True)
     model_choice = st.selectbox(
         "model", label_visibility="collapsed",
-        options=["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"],
+        options=settings.available_models,
         index=0,
     )
     st.session_state["model_name"] = model_choice
 
-    # ── KB status ─────────────────────────────────────────────────────────────
-    kb_s = idx_status.get("kb","")
-    if   kb_s == "built":      st.markdown('<span class="pill pill-green">KB built</span>',   unsafe_allow_html=True)
-    elif kb_s == "up_to_date": st.markdown('<span class="pill pill-blue">KB up to date</span>', unsafe_allow_html=True)
-    elif kb_s == "no_books":   st.markdown('<span class="pill pill-amber">No books found</span>', unsafe_allow_html=True)
-    elif kb_s == "no_api_key": st.markdown('<span class="pill pill-amber">KB needs API key</span>', unsafe_allow_html=True)
+    # ── System Health & Index Badges ──────────────────────────────────────────
+    st.markdown('<p class="sidebar-label">System Health</p>', unsafe_allow_html=True)
+    has_key = settings.has_api_key
+
+    if has_key:
+        st.markdown('<span class="pill pill-green">Gemini API Ready</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="pill pill-amber">API Key Required</span>', unsafe_allow_html=True)
+
+    kb_s = idx_status.get("kb", "")
+    if kb_s in ("built", "up_to_date"):
+        st.markdown('<span class="pill pill-blue">KB Ready</span>', unsafe_allow_html=True)
+    elif kb_s == "no_books":
+        st.markdown('<span class="pill pill-gray">No books</span>', unsafe_allow_html=True)
+
+    mem_s = idx_status.get("memory", "")
+    if mem_s in ("built", "up_to_date"):
+        st.markdown('<span class="pill pill-green">Memory Synced</span>', unsafe_allow_html=True)
+
+    with st.expander("Diagnostics", expanded=False):
+        if st.button("Run System Diagnostics", key="diag_btn", use_container_width=True):
+            with st.spinner("Probing tools and APIs..."):
+                from health import check_directories, check_gemini_api, check_tool_connectivity
+                d_ok, d_msg = check_directories()
+                g_ok, g_msg = check_gemini_api()
+                t_res = check_tool_connectivity()
+
+                st.write(f"**Storage:** {'PASS' if d_ok else 'FAIL'}")
+                st.write(f"**Gemini API:** {'PASS' if g_ok else 'WARN'} ({g_msg})")
+                for name, (ok, msg) in t_res.items():
+                    st.write(f"**{name}:** {'PASS' if ok else 'WARN'} ({msg})")
 
 
-# ─── Main area ────────────────────────────────────────────────────────────────
-has_key = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
-
+# ─── Main Area ────────────────────────────────────────────────────────────────
 st.markdown(
     '<div class="app-header">'
-    '<h1>JANE</h1>'
-    '<span>Just A Nuanced Engine &nbsp;·&nbsp; Multi-agent parallel research</span>'
+    f'<h1>{settings.app_name}</h1>'
+    f'<span>v{settings.app_version} &nbsp;·&nbsp; Parallel Academic & Web Intelligence</span>'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -677,20 +686,20 @@ st.markdown(
 if not has_key:
     st.markdown(
         '<div class="no-key-banner">'
-        'No API key found. Add <code>GOOGLE_API_KEY=your_key</code> to <code>.env</code> and restart. '
-        'arXiv, Wikipedia, and Web Search still work without it.'
+        'No Gemini API key detected. Set <code>GEMINI_API_KEY=...</code> in <code>.env</code>. '
+        'arXiv, Wikipedia, PubMed, and Web search remain active without an API key.'
         '</div>',
         unsafe_allow_html=True,
     )
 
-# ── Source toggles strip (in main chat area) ───────────────────────────────────
+# ── Source Toggles Strip ───────────────────────────────────────────────────────
 SOURCE_LABELS = [
-    ("enable_kb",     "Knowledge Base"),
+    ("enable_kb", "Knowledge Base"),
     ("enable_memory", "Memory"),
-    ("enable_arxiv",  "arXiv"),
-    ("enable_wiki",   "Wikipedia"),
+    ("enable_arxiv", "arXiv"),
+    ("enable_wiki", "Wikipedia"),
     ("enable_pubmed", "PubMed"),
-    ("enable_web",    "Web"),
+    ("enable_web", "Web"),
 ]
 src_cols = st.columns(len(SOURCE_LABELS))
 for i, (toggle_key, label) in enumerate(SOURCE_LABELS):
@@ -705,16 +714,19 @@ for i, (toggle_key, label) in enumerate(SOURCE_LABELS):
 
 st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
-# ── Conversation render ────────────────────────────────────────────────────────
+
+# ── Render Conversation History ───────────────────────────────────────────────
 if not st.session_state["prompts"]:
     with st.chat_message("assistant"):
         st.markdown(
-            "Hello. I'm JANE — I route your query through a heuristic orchestrator, "
-            "fire all relevant sources in parallel, then synthesise everything into a "
-            "structured research report. What would you like to explore?"
+            "Hello. I am **JANE** — a production research assistant. I analyze queries, "
+            "trigger specialized academic and web tools in parallel, and synthesize findings "
+            "into structured dossiers with full citations. What are we investigating today?"
         )
 
 ctx_list = st.session_state.get("contexts_list", [])
+turn_metrics = st.session_state.get("turn_metrics", [])
+
 for idx, (u, r) in enumerate(zip(st.session_state["prompts"], st.session_state["replies"])):
     with st.chat_message("user"):
         st.write(u)
@@ -724,125 +736,153 @@ for idx, (u, r) in enumerate(zip(st.session_state["prompts"], st.session_state["
             with st.expander(f"Retrieved Evidence ({len(ctx_list[idx])} sources)", expanded=False):
                 for c in ctx_list[idx]:
                     st.markdown(c)
+        if idx < len(turn_metrics) and turn_metrics[idx]:
+            m = turn_metrics[idx]
+            st.markdown(
+                f'<div class="telemetry-tag">'
+                f'⏱️ Total: {m.get("total_s", 0):.2f}s | '
+                f'Orchestration: {m.get("orchestrator_s", 0):.2f}s | '
+                f'Retrieval: {m.get("retriever_s", 0):.2f}s | '
+                f'Synthesis: {m.get("synthesis_s", 0):.2f}s'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
+
+# ── User Input & Execution Pipeline ───────────────────────────────────────────
 prompt = st.chat_input("Ask JANE a research question…")
 
 if prompt:
+    t_start = time.perf_counter()
+
     with st.chat_message("user"):
         st.write(prompt)
 
     inputs: ResearchState = {
-        "prompts":   [prompt],
-        "replies":   [],
+        "prompts": [prompt],
+        "replies": [],
         "tool_plan": [],
-        "contexts":  [],
+        "contexts": [],
+        "refined_query": "",
+        "telemetry": {},
     }
 
-    reply              = ""
     captured_contexts: List[str] = []
+    orchestrator_s = 0.0
+    retriever_s = 0.0
+    synthesis_s = 0.0
+    reply = ""
 
     with st.chat_message("assistant"):
-        status_box  = st.empty()
-        stream_box  = st.empty()
+        status_box = st.empty()
+        stream_box = st.empty()
 
+        # Step 1 & 2: Run Orchestrator and Parallel Retriever via Graph
         for chunk in research_graph.stream(inputs, stream_mode="updates"):
             node = next(iter(chunk))
             data = chunk[node]
 
             if node == "orchestrator":
-                plan    = data.get("tool_plan", [])
+                plan = data.get("tool_plan", [])
                 refined = data.get("refined_query", "")
-                labels  = ", ".join(TOOL_LABELS.get(t, t) for t in plan)
+                labels = ", ".join(TOOL_LABELS.get(t, t) for t in plan)
+                orchestrator_s = data.get("telemetry", {}).get("orchestrator_latency", 0.0)
                 rewrite_hint = (
-                    f" <span style='color:#484f58;font-size:0.73rem'>(search: {refined})</span>"
+                    f" <span style='color:#6e7681;font-size:0.73rem'>(query: {refined})</span>"
                     if refined and refined != prompt else ""
                 )
                 status_box.markdown(
                     f"**Routing** — {len(plan)} source(s): "
-                    f"<span style='color:#484f58;font-size:0.76rem'>{labels}</span>"
+                    f"<span style='color:#58a6ff;font-size:0.76rem'>{labels}</span>"
                     f"{rewrite_hint}",
                     unsafe_allow_html=True,
                 )
             elif node == "retriever":
                 captured_contexts = data.get("contexts", [])
+                retriever_s = data.get("telemetry", {}).get("retriever_latency", 0.0)
                 n = len(captured_contexts)
-                status_box.markdown(f"**Gathering** — {n} source(s) responded. Synthesising...")
-            elif node == "synthesiser":
-                replies = data.get("replies", [])
-                if replies:
-                    reply = replies[-1]
+                status_box.markdown(f"**Gathered** — {n} source(s) responded in {retriever_s:.2f}s. Synthesising...")
 
         status_box.empty()
 
-        # Improvement 2 — Stream the reply token-by-token for perceived responsiveness.
-        # If streaming is unavailable (e.g. non-streaming model), fall back to st.markdown.
-        if reply:
-            key   = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-            model = st.session_state.get("model_name", "gemini-2.5-flash-lite")
-            if key:
-                try:
-                    from langchain_google_genai import ChatGoogleGenerativeAI
-                    contexts = captured_contexts
-                    ctx_block = (
-                        f"## Retrieved Context ({len(contexts)} source(s))\n\n"
-                        + "\n\n---\n\n".join(contexts)
-                        if contexts else "No external research context was retrieved."
-                    )
-                    stream_llm = ChatGoogleGenerativeAI(
-                        model=model, google_api_key=key,
-                        temperature=0.35, max_retries=2,
-                    )
-                    # Re-build messages for streaming (same as synthesiser_node)
-                    stream_msgs = [SystemMessage(content=SYSTEM_PROMPT)]
-                    stream_msgs.append(HumanMessage(content=ctx_block))
-                    for p_hist, r_hist in zip(
-                        st.session_state["prompts"], st.session_state["replies"]
-                    ):
-                        stream_msgs.append(HumanMessage(content=p_hist))
-                        stream_msgs.append(AIMessage(content=r_hist))
-                    stream_msgs.append(HumanMessage(content=prompt))
+        # Step 3: Single-Pass Streaming Synthesis (Eliminating redundant double LLM invocation)
+        t_synth_start = time.perf_counter()
+        ctx_block = (
+            f"## Retrieved Context ({len(captured_contexts)} source(s))\n\n"
+            + "\n\n---\n\n".join(captured_contexts)
+            if captured_contexts else "No external research context was retrieved."
+        )
 
-                    streamed_tokens: List[str] = []
-                    with stream_box:
-                        placeholder = st.empty()
-                        for tok in stream_llm.stream(stream_msgs):
-                            streamed_tokens.append(tok.content)
-                            placeholder.markdown("".join(streamed_tokens) + " |")
-                        placeholder.markdown("".join(streamed_tokens))
-                    # Use the streamed text as the canonical reply
-                    reply = "".join(streamed_tokens)
-                except Exception as stream_exc:
-                    logger.warning("Streaming fell back to batch: %s", stream_exc)
-                    stream_box.markdown(reply)
-            else:
-                stream_box.markdown(reply)
+        key = settings.api_key
+        model = st.session_state.get("model_name", settings.default_model)
+
+        if not key:
+            reply = (
+                "> **No Gemini API Key Configured.** Set `GEMINI_API_KEY=...` in `.env` to enable AI synthesis.\n\n"
+                "---\n\n" + ctx_block
+            )
+            stream_box.markdown(reply)
+            synthesis_s = time.perf_counter() - t_synth_start
         else:
-            reply = "No response generated. Check your API key and connection."
-            stream_box.warning(reply)
+            try:
+                stream_llm = _get_llm(model, key)
+                stream_msgs = _build_messages(
+                    prompts=st.session_state["prompts"],
+                    replies=st.session_state["replies"],
+                    ctx_block=ctx_block,
+                    current_prompt=prompt,
+                )
+
+                streamed_tokens: List[str] = []
+                with stream_box:
+                    placeholder = st.empty()
+                    for tok in stream_llm.stream(stream_msgs):
+                        streamed_tokens.append(tok.content)
+                        placeholder.markdown("".join(streamed_tokens) + " ▌")
+                    placeholder.markdown("".join(streamed_tokens))
+
+                reply = "".join(streamed_tokens)
+                synthesis_s = time.perf_counter() - t_synth_start
+            except Exception as stream_exc:
+                app_logger.error(f"Streaming error: {stream_exc}")
+                reply = f"**Synthesis Error:** `{stream_exc}`\n\n---\n\n{ctx_block}"
+                stream_box.markdown(reply)
+                synthesis_s = time.perf_counter() - t_synth_start
+
+    total_s = time.perf_counter() - t_start
+
+    # Record turn metrics
+    metrics = {
+        "total_s": total_s,
+        "orchestrator_s": orchestrator_s,
+        "retriever_s": retriever_s,
+        "synthesis_s": synthesis_s,
+    }
 
     st.session_state["prompts"].append(prompt)
     st.session_state["replies"].append(reply)
     st.session_state.setdefault("contexts_list", []).append(captured_contexts)
+    st.session_state.setdefault("turn_metrics", []).append(metrics)
 
-    # Save session with retrieved context attached to this turn
+    # Save session
     saved_id = save_chat_session(
         prompts=st.session_state["prompts"],
         replies=st.session_state["replies"],
-        folder_path="past_chats",
+        folder_path=settings.past_chats_dir,
         session_id=st.session_state.get("session_id"),
         latest_contexts=captured_contexts,
     )
     st.session_state["session_id"] = saved_id
 
-    # Refresh memory index so next query sees this turn
+    # Incremental memory index update (only embeds new turn)
     if has_key:
         try:
             build_memory_index(
-                google_api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
-                folder_path="past_chats",
-                scans_dir="scans",
+                google_api_key=key,
+                folder_path=settings.past_chats_dir,
+                scans_dir=settings.scans_dir,
             )
-        except Exception as _e:
-            logger.warning("Memory refresh: %s", _e)
+        except Exception as exc:
+            app_logger.warning(f"Memory index refresh error: {exc}")
 
     st.rerun()

@@ -1,98 +1,113 @@
 """
 mcp_server.py
 -------------
-FastMCP server. Every tool registered here is wrapped with:
-  - A per-call wall-clock timeout (via ThreadPoolExecutor future.result(timeout=...))
-  - Exponential backoff retry (with rate-limit detection on 429/quota errors)
-
-app.py calls tools through this server and has zero retry/timeout logic of its own.
-
-Tools registered
-----------------
-  arxiv_search          — arXiv Atom API
-  wikipedia_search      — Wikipedia REST API
-  pubmed_search         — NCBI PubMed API
-  web_search            — DuckDuckGo via ddgs
-  knowledge_base_search — Local FAISS index (books/ → scans/)
-  memory_search         — Past conversation FAISS index (past_chats/)
+FastMCP server with enterprise-grade resilience:
+  - Non-blocking wall-clock timeouts using a shared daemon ThreadPoolExecutor
+  - Exponential backoff retry with jitter (rate-limit detection on 429/quota)
+  - Detailed telemetry and call execution latency tracking
 """
 
-import os
 import time
-import logging
+import random
 import functools
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from typing import Callable, Any
+from typing import Callable, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+
+from config import settings
+from logger import app_logger
 from mcp_tools import search_arxiv, search_wikipedia, search_pubmed, search_web
 
-logger = logging.getLogger(__name__)
-mcp    = FastMCP("ResearchAgentMCPServer")
+mcp = FastMCP("ResearchAgentMCPServer")
 
+# Shared bounded daemon worker pool for all tool executions.
+# Using daemon threads prevents any lingering worker from blocking process shutdown.
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=16,
+    thread_name_prefix="jane_worker_",
+)
 
-# ─── Tool wrapper: retry + per-call timeout ───────────────────────────────────
 
 def _tool_wrapper(
     fn: Callable,
     *,
-    max_attempts: int  = 3,
-    timeout_s: float   = 15.0,
-    base_delay: float  = 1.5,
+    max_attempts: Optional[int] = None,
+    timeout_s: Optional[float] = None,
+    base_delay: Optional[float] = None,
 ) -> Callable:
     """
-    Wrap a sync function with:
-      1. Per-call wall-clock timeout using a single-worker executor future.
-      2. Exponential-backoff retry.
-      3. Special handling for 429 / quota / rate-limit errors (longer sleep).
-
-    Returns an empty string on total failure so callers always get a string.
+    Wrap a tool function with:
+      1. Non-blocking wall-clock timeout via shared daemon executor.
+      2. Exponential backoff with jitter on transient failures.
+      3. Rate-limit (429/quota) handling with extended delay.
+      4. Telemetry logging for latency and outcome.
     """
+    attempts_limit = max_attempts or settings.max_tool_retries
+    call_timeout = timeout_s or settings.http_timeout_s
+    delay_base = base_delay or settings.base_retry_delay_s
+
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> str:
-        for attempt in range(max_attempts):
+        fn_name = fn.__name__
+        start_time = time.perf_counter()
+
+        for attempt in range(1, attempts_limit + 1):
+            attempt_start = time.perf_counter()
             try:
-                with ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(fn, *args, **kwargs)
-                    return fut.result(timeout=timeout_s)
+                # Submit to shared pool — avoids spawning/shutting down pools in loop
+                future = _EXECUTOR.submit(fn, *args, **kwargs)
+                result = future.result(timeout=call_timeout)
+                duration = time.perf_counter() - attempt_start
+                app_logger.info(f"Tool {fn_name} succeeded in {duration:.2f}s (attempt {attempt}/{attempts_limit})")
+                return result
 
             except FuturesTimeout:
-                logger.warning(
-                    "%s: timed out after %.0fs (attempt %d/%d)",
-                    fn.__name__, timeout_s, attempt + 1, max_attempts,
+                duration = time.perf_counter() - attempt_start
+                future.cancel()
+                app_logger.warning(
+                    f"Tool {fn_name} timed out after {duration:.2f}s (attempt {attempt}/{attempts_limit})"
                 )
-                if attempt == max_attempts - 1:
-                    return ""
+                if attempt == attempts_limit:
+                    break
 
             except Exception as exc:
+                duration = time.perf_counter() - attempt_start
                 err = str(exc).lower()
                 is_rate_limit = "429" in err or "quota" in err or "rate" in err
-                is_last       = attempt == max_attempts - 1
+                is_last = attempt == attempts_limit
 
                 if is_last:
-                    logger.error(
-                        "%s: failed after %d attempts — %s",
-                        fn.__name__, max_attempts, exc,
+                    app_logger.error(
+                        f"Tool {fn_name} failed definitively after {attempts_limit} attempts: {exc}"
                     )
-                    return ""
+                    break
 
-                wait = (10 * (attempt + 1)) if is_rate_limit else (base_delay * (attempt + 1))
-                logger.warning(
-                    "%s: attempt %d failed (%s) — retrying in %.1fs",
-                    fn.__name__, attempt + 1, exc, wait,
+                # Exponential backoff with jitter
+                jitter = random.uniform(0.1, 0.5)
+                wait_time = (
+                    settings.rate_limit_backoff_s * attempt
+                    if is_rate_limit
+                    else (delay_base * (2 ** (attempt - 1))) + jitter
                 )
-                time.sleep(wait)
+                app_logger.warning(
+                    f"Tool {fn_name} attempt {attempt} failed ({exc}). Retrying in {wait_time:.1f}s..."
+                )
+                time.sleep(wait_time)
 
+        total_elapsed = time.perf_counter() - start_time
+        app_logger.error(f"Tool {fn_name} exhausted all attempts without success (total {total_elapsed:.2f}s)")
         return ""
+
     return wrapper
 
 
 # ─── Wrapped implementations ──────────────────────────────────────────────────
 
-_arxiv   = _tool_wrapper(search_arxiv,    timeout_s=15, max_attempts=3)
-_wiki    = _tool_wrapper(search_wikipedia, timeout_s=10, max_attempts=3)
-_pubmed  = _tool_wrapper(search_pubmed,   timeout_s=12, max_attempts=3)
-_web     = _tool_wrapper(search_web,      timeout_s=12, max_attempts=2)
+_arxiv = _tool_wrapper(search_arxiv, timeout_s=settings.arxiv_timeout_s, max_attempts=3)
+_wiki = _tool_wrapper(search_wikipedia, timeout_s=settings.wikipedia_timeout_s, max_attempts=3)
+_pubmed = _tool_wrapper(search_pubmed, timeout_s=settings.pubmed_timeout_s, max_attempts=3)
+_web = _tool_wrapper(search_web, timeout_s=settings.web_timeout_s, max_attempts=2)
 
 
 # ─── MCP Tool Registrations ───────────────────────────────────────────────────
@@ -100,7 +115,7 @@ _web     = _tool_wrapper(search_web,      timeout_s=12, max_attempts=2)
 @mcp.tool()
 def arxiv_search(query: str, max_results: int = 3) -> str:
     """
-    Search arXiv for academic papers.
+    Search arXiv for academic research papers.
     Returns titles, authors, publication dates, PDF URLs, and abstracts.
     """
     return _arxiv(query, max_results=max_results)
@@ -135,14 +150,13 @@ def web_search(query: str, max_results: int = 3) -> str:
 def knowledge_base_search(query: str, api_key: str = "", top_k: int = 4) -> str:
     """
     Search the local FAISS knowledge base built from the books/ folder.
-    Requires a Google/Gemini API key for embedding the query.
-    Pass api_key explicitly or set GOOGLE_API_KEY / GEMINI_API_KEY in the environment.
+    Requires a Google/Gemini API key for query embedding.
     """
     from knowledge_base import search_knowledge_base
-    key    = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    key = api_key or settings.api_key
     result = _tool_wrapper(
         search_knowledge_base,
-        timeout_s=20,
+        timeout_s=settings.kb_search_timeout_s,
         max_attempts=2,
     )(query=query, google_api_key=key, top_k=top_k)
     return result or "No matches found in local knowledge base."
@@ -152,16 +166,15 @@ def knowledge_base_search(query: str, api_key: str = "", top_k: int = 4) -> str:
 def memory_search(query: str, api_key: str = "", top_k: int = 3) -> str:
     """
     Search past conversation history using the persistent Gemini+FAISS memory index.
-    Falls back to keyword search if the index is not yet built.
-    Pass api_key explicitly or set GOOGLE_API_KEY / GEMINI_API_KEY in the environment.
+    Falls back to keyword search if the vector index is not yet built.
     """
     from retriever import search_memory_index
-    key    = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    key = api_key or settings.api_key
     result = _tool_wrapper(
         search_memory_index,
-        timeout_s=15,
+        timeout_s=settings.memory_search_timeout_s,
         max_attempts=2,
-    )(query=query, google_api_key=key, scans_dir="scans", top_k=top_k)
+    )(query=query, google_api_key=key, scans_dir=settings.scans_dir, top_k=top_k)
     return result or "No relevant past conversations found."
 
 

@@ -1,29 +1,30 @@
 """
 retriever.py
 ------------
-Chat session persistence, document preparation, and memory search.
+Chat session persistence, document preparation, and high-performance
+incremental memory search.
 
-Memory index is persisted to scans/memory_index/ using FAISS so the
-vector store is not rebuilt from scratch on every query.
-After each new chat turn is saved, the index is refreshed incrementally.
+Features:
+  - Atomic, durable session persistence to past_chats/
+  - Incremental FAISS vector store updating via memory_manifest.json
+    (prevents redundant re-embedding of past conversation history)
+  - Publication-ready Markdown dossier exports
 """
 
 import os
 import json
 import glob
-import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Re-export KB helpers so app.py has one import point
+from config import settings
+from logger import app_logger
+
+# Re-export KB helpers so callers have one clean import point
 from knowledge_base import build_knowledge_base_if_needed, search_knowledge_base
-
-logger = logging.getLogger(__name__)
-
-MEMORY_INDEX_SUBDIR = "memory_index"
 
 __all__ = [
     "save_chat_session",
@@ -33,7 +34,7 @@ __all__ = [
     "prepare_chat_documents",
     "build_memory_index",
     "search_memory_index",
-    "search_past_chats",          # kept for backwards compat / fallback
+    "search_past_chats",
     "build_knowledge_base_if_needed",
     "search_knowledge_base",
 ]
@@ -44,13 +45,13 @@ __all__ = [
 def save_chat_session(
     prompts: List[str],
     replies: List[str],
-    folder_path: str = "past_chats",
+    folder_path: str = settings.past_chats_dir,
     session_id: Optional[str] = None,
     latest_contexts: Optional[List[str]] = None,
 ) -> str:
     """
     Save or update the current chat session as a JSON file.
-    latest_contexts: the raw retrieved context blocks for the most recent turn.
+    Preserves contexts from prior turns and attaches latest_contexts to the current turn.
     Returns the session_id.
     """
     os.makedirs(folder_path, exist_ok=True)
@@ -60,22 +61,20 @@ def save_chat_session(
 
     file_path = os.path.join(folder_path, f"{session_id}.json")
 
-    # Load existing chats so we preserve contexts from prior turns
+    # Load existing chats to preserve contexts from prior turns
     existing_chats: List[Dict[str, Any]] = []
     if os.path.exists(file_path):
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 existing_chats = json.load(f).get("chats", [])
-        except Exception:
-            pass
+        except Exception as exc:
+            app_logger.warning(f"Failed to read existing session {file_path}: {exc}")
 
     chats: List[Dict[str, Any]] = []
     for i, (p, r) in enumerate(zip(prompts, replies)):
         turn: Dict[str, Any] = {"prompt": p, "reply": r}
-        # Preserve contexts from previously saved turns
         if i < len(existing_chats) and "contexts" in existing_chats[i]:
             turn["contexts"] = existing_chats[i]["contexts"]
-        # Attach fresh contexts to the latest (last) turn
         if i == len(prompts) - 1 and latest_contexts:
             turn["contexts"] = latest_contexts
         chats.append(turn)
@@ -85,18 +84,26 @@ def save_chat_session(
         "updated_at": datetime.now().isoformat(),
         "chats": chats,
     }
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(session_data, f, indent=2, ensure_ascii=False)
 
+    temp_path = f"{file_path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(session_data, f, indent=2, ensure_ascii=False)
+    os.replace(temp_path, file_path)
+
+    app_logger.info(f"Saved session {session_id} ({len(chats)} turns)")
     return session_id
 
 
-def delete_chat_session(session_id: str, folder_path: str = "past_chats") -> bool:
+def delete_chat_session(session_id: str, folder_path: str = settings.past_chats_dir) -> bool:
     """Delete the JSON file for the given session_id. Returns True if deleted."""
     file_path = os.path.join(folder_path, f"{session_id}.json")
     if os.path.exists(file_path):
-        os.remove(file_path)
-        return True
+        try:
+            os.remove(file_path)
+            app_logger.info(f"Deleted chat session: {session_id}")
+            return True
+        except Exception as exc:
+            app_logger.error(f"Failed to delete session {session_id}: {exc}")
     return False
 
 
@@ -114,9 +121,9 @@ def export_session_to_markdown(
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sid = session_id or "adhoc_session"
     lines = [
-        f"# JANE Research Dossier - Session `{sid}`",
+        f"# JANE Research Dossier — Session `{sid}`",
         f"**Generated:** {now_str}  ",
-        f"**Model:** {model_name or 'Gemini'}  ",
+        f"**Model:** {model_name or settings.default_model}  ",
         f"**Total Research Queries:** {len(prompts)}",
         "\n---",
     ]
@@ -140,32 +147,37 @@ def export_session_to_markdown(
     return "\n".join(lines)
 
 
-# ─── 2. Document preparation ──────────────────────────────────────────────────
+# ─── 2. Document Preparation ──────────────────────────────────────────────────
 
-def load_all_chat_sessions(folder_path: str = "past_chats") -> List[Dict[str, Any]]:
-    """Load all JSON files from past_chats/ and return their dicts."""
+def load_all_chat_sessions(folder_path: str = settings.past_chats_dir) -> List[Dict[str, Any]]:
+    """Load all JSON files from past_chats/ and return their dictionaries."""
     if not os.path.exists(folder_path):
         return []
     sessions = []
-    for fp in glob.glob(os.path.join(folder_path, "*.json")):
+    for fp in sorted(glob.glob(os.path.join(folder_path, "*.json"))):
         try:
             with open(fp, "r", encoding="utf-8") as f:
-                sessions.append(json.load(f))
+                data = json.load(f)
+                if isinstance(data, dict) and "chats" in data:
+                    sessions.append(data)
         except Exception as exc:
-            logger.warning("Could not load %s: %s", fp, exc)
+            app_logger.warning(f"Could not load chat file {fp}: {exc}")
     return sessions
 
 
-def prepare_chat_documents(folder_path: str = "past_chats") -> List[Document]:
+def prepare_chat_documents(
+    sessions: Optional[List[Dict[str, Any]]] = None,
+    folder_path: str = settings.past_chats_dir,
+) -> List[Document]:
     """
-    Convert all past chat turns into chunked LangChain Document objects
-    suitable for embedding and vector search.
+    Convert chat sessions into chunked LangChain Document objects.
+    If sessions list is not provided, loads all from folder_path.
     """
-    sessions     = load_all_chat_sessions(folder_path)
+    chat_sessions = sessions if sessions is not None else load_all_chat_sessions(folder_path)
     raw_documents: List[Document] = []
 
-    for session in sessions:
-        sid   = session.get("session_id", "unknown")
+    for session in chat_sessions:
+        sid = session.get("session_id", "unknown")
         chats = session.get("chats", [])
         for i, turn in enumerate(chats, 1):
             content = (
@@ -184,17 +196,20 @@ def prepare_chat_documents(folder_path: str = "past_chats") -> List[Document]:
     if not raw_documents:
         return []
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.memory_chunk_size,
+        chunk_overlap=settings.memory_chunk_overlap,
+    )
     return splitter.split_documents(raw_documents)
 
 
-# ─── 3. Persistent memory index ───────────────────────────────────────────────
+# ─── 3. Persistent & Incremental Memory Index ─────────────────────────────────
 
-def _memory_index_path(scans_dir: str) -> str:
-    return os.path.join(scans_dir, MEMORY_INDEX_SUBDIR)
+def _memory_index_path(scans_dir: str = settings.scans_dir) -> str:
+    return os.path.join(scans_dir, settings.memory_index_subdir)
 
 
-def _memory_index_exists(scans_dir: str) -> bool:
+def _memory_index_exists(scans_dir: str = settings.scans_dir) -> bool:
     d = _memory_index_path(scans_dir)
     return (
         os.path.exists(os.path.join(d, "index.faiss"))
@@ -202,58 +217,131 @@ def _memory_index_exists(scans_dir: str) -> bool:
     )
 
 
+def _load_memory_manifest(scans_dir: str) -> Dict[str, Any]:
+    manifest_path = os.path.join(scans_dir, settings.memory_manifest_filename)
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            app_logger.warning(f"Failed to read memory manifest: {exc}")
+    return {}
+
+
+def _save_memory_manifest(scans_dir: str, manifest: Dict[str, Any]) -> None:
+    manifest_path = os.path.join(scans_dir, settings.memory_manifest_filename)
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    except Exception as exc:
+        app_logger.warning(f"Failed to save memory manifest: {exc}")
+
+
 def build_memory_index(
     google_api_key: Optional[str] = None,
-    folder_path: str = "past_chats",
-    scans_dir: str = "scans",
+    folder_path: str = settings.past_chats_dir,
+    scans_dir: str = settings.scans_dir,
 ) -> str:
     """
-    Build or refresh the FAISS memory index from all past_chats/ JSON files.
-    Persists the index to scans/memory_index/.
+    Build or incrementally refresh the FAISS memory index from past_chats/.
+    Utilizes manifest tracking so only new/modified chat sessions are embedded.
 
-    Returns: "built" | "no_chats" | "no_api_key" | "error:<msg>"
+    Returns: "built" | "up_to_date" | "no_chats" | "no_api_key" | "error:<msg>"
     """
-    api_key = google_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    api_key = google_api_key or settings.api_key
     if not api_key:
         return "no_api_key"
 
-    docs = prepare_chat_documents(folder_path)
-    if not docs:
+    all_sessions = load_all_chat_sessions(folder_path)
+    if not all_sessions:
         return "no_chats"
+
+    index_dir = _memory_index_path(scans_dir)
+    os.makedirs(index_dir, exist_ok=True)
+    manifest = _load_memory_manifest(scans_dir)
+
+    # Current fingerprint of sessions
+    current_fingerprint = {}
+    for s in all_sessions:
+        sid = s.get("session_id")
+        if sid:
+            current_fingerprint[sid] = {
+                "updated_at": s.get("updated_at", ""),
+                "turn_count": len(s.get("chats", [])),
+            }
+
+    index_exists = _memory_index_exists(scans_dir)
+
+    # If index exists and all sessions match manifest, skip entirely
+    if index_exists and manifest.get("sessions") == current_fingerprint:
+        app_logger.info("[Memory] Memory index is up-to-date — skipping rebuild.")
+        return "up_to_date"
 
     try:
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
         from langchain_community.vectorstores import FAISS
 
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
+            model=settings.embedding_model,
             google_api_key=api_key,
         )
-        index_dir = _memory_index_path(scans_dir)
-        os.makedirs(index_dir, exist_ok=True)
 
-        vector_store = FAISS.from_documents(docs, embeddings)
+        old_sessions_meta = manifest.get("sessions", {})
+
+        # If index exists, attempt incremental update for only new or modified sessions
+        if index_exists and old_sessions_meta:
+            changed_sessions = []
+            for s in all_sessions:
+                sid = s.get("session_id")
+                curr_meta = current_fingerprint.get(sid)
+                if sid not in old_sessions_meta or old_sessions_meta[sid] != curr_meta:
+                    changed_sessions.append(s)
+
+            if changed_sessions:
+                app_logger.info(
+                    f"[Memory] Incrementally indexing {len(changed_sessions)} modified session(s)..."
+                )
+                new_docs = prepare_chat_documents(changed_sessions)
+                if new_docs:
+                    vector_store = FAISS.load_local(
+                        index_dir,
+                        embeddings,
+                        allow_dangerous_deserialization=True,
+                    )
+                    vector_store.add_documents(new_docs)
+                    vector_store.save_local(index_dir)
+                    _save_memory_manifest(scans_dir, {"sessions": current_fingerprint})
+                    app_logger.info(f"[Memory] Appended {len(new_docs)} new chunks to memory index.")
+                    return "built"
+
+        # Full rebuild if index doesn't exist or clean state needed
+        app_logger.info(f"[Memory] Building complete memory index from {len(all_sessions)} session(s)...")
+        all_docs = prepare_chat_documents(all_sessions)
+        if not all_docs:
+            return "no_chats"
+
+        vector_store = FAISS.from_documents(all_docs, embeddings)
         vector_store.save_local(index_dir)
-        logger.info("Memory index built: %d chunks → %s", len(docs), index_dir)
+        _save_memory_manifest(scans_dir, {"sessions": current_fingerprint})
+        app_logger.info(f"[Memory] Memory index successfully built: {len(all_docs)} chunks → {index_dir}")
         return "built"
 
     except Exception as exc:
-        logger.error("Memory index build failed: %s", exc)
+        app_logger.error(f"[Memory] Memory index build failed: {exc}")
         return f"error:{exc}"
 
 
 def search_memory_index(
     query: str,
     google_api_key: Optional[str] = None,
-    scans_dir: str = "scans",
+    scans_dir: str = settings.scans_dir,
     top_k: int = 3,
 ) -> str:
     """
     Search the persistent memory FAISS index.
     Falls back to on-the-fly keyword search if the index is not available.
-    Returns formatted string of top-k matching passages, or "".
     """
-    api_key = google_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    api_key = google_api_key or settings.api_key
 
     if api_key and _memory_index_exists(scans_dir):
         try:
@@ -261,10 +349,10 @@ def search_memory_index(
             from langchain_community.vectorstores import FAISS
 
             embeddings = GoogleGenerativeAIEmbeddings(
-                model="models/text-embedding-004",
+                model=settings.embedding_model,
                 google_api_key=api_key,
             )
-            vs      = FAISS.load_local(
+            vs = FAISS.load_local(
                 _memory_index_path(scans_dir),
                 embeddings,
                 allow_dangerous_deserialization=True,
@@ -276,60 +364,39 @@ def search_memory_index(
                     for i, doc in enumerate(matched, 1)
                 )
         except Exception as exc:
-            logger.warning("Memory index search failed, falling back: %s", exc)
+            app_logger.warning(f"Memory index search failed, falling back: {exc}")
 
-    # Keyword fallback (no API key or index read error)
+    # Keyword fallback
     return search_past_chats(query, google_api_key=api_key, top_k=top_k)
 
 
-# ─── 4. Legacy on-the-fly search (kept as fallback) ──────────────────────────
+# ─── 4. Keyword Fallback Search ───────────────────────────────────────────────
 
 def search_past_chats(
     query: str,
     google_api_key: Optional[str] = None,
-    folder_path: str = "past_chats",
+    folder_path: str = settings.past_chats_dir,
     top_k: int = 3,
 ) -> str:
     """
-    Searches past chat history.
-    Builds a transient FAISS store when a key is available;
-    falls back to keyword scoring otherwise.
+    Fallback keyword search over past chat history when vector index is unavailable.
     """
-    api_key = google_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    docs    = prepare_chat_documents(folder_path)
-
+    docs = prepare_chat_documents(folder_path=folder_path)
     if not docs:
         return ""
 
-    if api_key:
-        try:
-            from langchain_google_genai import GoogleGenerativeAIEmbeddings
-            from langchain_community.vectorstores import FAISS
-
-            embeddings   = GoogleGenerativeAIEmbeddings(
-                model="models/text-embedding-004",
-                google_api_key=api_key,
-            )
-            vector_store = FAISS.from_documents(docs, embeddings)
-            matched      = vector_store.similarity_search(query, k=top_k)
-            return "\n\n".join(
-                f"[{i}] (Session: {doc.metadata.get('session_id', '?')})\n{doc.page_content}"
-                for i, doc in enumerate(matched, 1)
-            )
-        except Exception as exc:
-            logger.warning("Embedding search failed: %s", exc)
-
-    # Keyword fallback
     query_words = set(query.lower().split())
-    scored      = []
+    scored = []
     for doc in docs:
         score = sum(1 for w in query_words if w in doc.page_content.lower())
         if score > 0:
             scored.append((score, doc))
+
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [d for _, d in scored[:top_k]]
     if not top:
         return ""
+
     return "\n\n".join(
         f"[{i}] (Session: {doc.metadata.get('session_id', '?')})\n{doc.page_content}"
         for i, doc in enumerate(top, 1)
